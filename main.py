@@ -100,9 +100,19 @@ Examples:
     )
     parser.add_argument(
         "--llm-provider",
-        default="openai",
-        choices=["openai", "anthropic", "local"],
-        help="LLM provider for postprocessing",
+        default="local",
+        choices=["local", "claude", "openai", "anthropic"],
+        help="LLM provider: local (Ollama, free), claude, openai (default: local)",
+    )
+    parser.add_argument(
+        "--restore-audio",
+        action="store_true",
+        help="Synthesize restored text via TTS and splice back into audio (requires gtts or pyttsx3)",
+    )
+    parser.add_argument(
+        "--tts-language",
+        default="ru",
+        help="Language code for TTS synthesis when --restore-audio is used (default: ru)",
     )
     parser.add_argument(
         "--confidence-threshold",
@@ -120,10 +130,10 @@ Examples:
 
 
 def save_results(
-    output_dir: Path,
-    transcript_segments: list,
-    full_text: str,
-    logger: logging.Logger,
+        output_dir: Path,
+        transcript_segments: list,
+        full_text: str,
+        logger: logging.Logger,
 ):
     """Save transcript.txt and transcript.json."""
 
@@ -248,6 +258,10 @@ def main():
     # ─── STEP 5: Postprocessing ───────────────────────────────────────────────
     logger.info("\n[STEP 5/5] Postprocessing transcript...")
     try:
+        restored_audio_path = str(output_dir / "audio_restored.wav")
+        # restore_audio is auto-enabled when llm_postprocess is used
+        do_restore_audio = args.llm_postprocess or getattr(args, "restore_audio", False)
+        tts_lang = getattr(args, "tts_language", None) or (args.language if args.language != "auto" else "en")
         final_segments, full_text = postprocess_transcript(
             segments=asr_segments,
             use_llm=args.llm_postprocess,
@@ -255,6 +269,10 @@ def main():
             confidence_threshold=args.confidence_threshold,
             language=args.language,
             logger=logger,
+            restore_audio=do_restore_audio,
+            audio_path=asr_input,
+            output_audio_path=restored_audio_path,
+            tts_language=tts_lang,
         )
     except Exception as e:
         logger.warning(f"Postprocessing error: {e}. Using raw ASR output.")
@@ -273,6 +291,8 @@ def main():
     print(f"  Segments found : {len(final_segments)}")
     print(f"  Output folder  : {output_dir.resolve()}")
     print(f"  Enhanced audio : {output_dir / 'audio_enhanced.wav'}")
+    if args.llm_postprocess or getattr(args, 'restore_audio', False):
+        print(f"  Restored audio : {output_dir / 'audio_restored.wav'}")
     print(f"  Transcript TXT : {txt_path}")
     print(f"  Transcript JSON: {json_path}")
     print("=" * 60 + "\n")
