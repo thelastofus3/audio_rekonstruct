@@ -2,8 +2,15 @@
 # file: postprocess.py
 Transcript postprocessing:
   - Mark unclear/inaudible segments with [неразборчиво], [предположение], [вариант1/вариант2]
-  - Optional LLM restoration of unclear text
+  - LLM restoration of unclear text via internal Claude API (no external API key package needed)
+  - Optional TTS audio restoration: synthesize restored text and splice back into audio
   - Build clean full-text transcript
+
+LLM provider options:
+  "claude"    — uses api.anthropic.com directly via requests (requires ANTHROPIC_API_KEY)
+  "openai"    — uses OpenAI API (requires OPENAI_API_KEY)
+  "anthropic" — same as "claude" but via anthropic package
+  "local"     — Ollama or local OpenAI-compatible endpoint
 """
 
 import json
@@ -19,23 +26,32 @@ ASSUMPTION_TAG = "[предположение]"
 
 
 def postprocess_transcript(
-    segments: List[dict],
-    use_llm: bool = False,
-    llm_provider: str = "openai",
-    confidence_threshold: float = 0.5,
-    language: str = "auto",
-    logger: logging.Logger = None,
+        segments: List[dict],
+        use_llm: bool = False,
+        llm_provider: str = "claude",
+        confidence_threshold: float = 0.5,
+        language: str = "auto",
+        logger: logging.Logger = None,
+        # TTS audio restoration options
+        restore_audio: bool = False,
+        audio_path: str = None,
+        output_audio_path: str = None,
+        tts_language: str = "ru",
 ) -> Tuple[List[dict], str]:
     """
-    Postprocess ASR segments: mark unclear parts, optionally use LLM.
+    Postprocess ASR segments: mark unclear parts, optionally use LLM + TTS.
 
     Args:
         segments: List of ASR segment dicts.
-        use_llm: Whether to use LLM for unclear restoration.
-        llm_provider: 'openai', 'anthropic', or 'local'.
+        use_llm: Whether to use LLM for unclear text restoration.
+        llm_provider: 'claude', 'openai', 'anthropic', or 'local'.
         confidence_threshold: Threshold below which segment is unclear.
         language: Language code for LLM prompting.
         logger: Optional logger.
+        restore_audio: If True, synthesize restored text via TTS and splice into audio.
+        audio_path: Path to source WAV (required if restore_audio=True).
+        output_audio_path: Path to save restored audio WAV.
+        tts_language: Language for TTS synthesis (e.g. 'ru', 'en').
 
     Returns:
         (processed_segments, full_text)
@@ -56,17 +72,43 @@ def postprocess_transcript(
 
     # Step 3: LLM restoration (optional)
     if use_llm:
-        unclear_count = sum(1 for s in processed if s.get("is_unclear"))
+        _wre = re.compile(r'\[[^\]]+\?\]')
+        unclear_count = sum(
+            1 for s in processed
+            if s.get("is_unclear") or _wre.search(s.get("text", ""))
+        )
         if unclear_count > 0:
             log.info(f"Running LLM restoration on {unclear_count} unclear segments...")
             processed = _llm_restore(processed, llm_provider, language, log)
         else:
             log.info("No unclear segments for LLM restoration.")
 
-    # Step 4: Build full text
+    # Step 4: TTS audio restoration
+    # Only for fully inaudible segments ([неразборчиво]), NOT for [предположение]
+    if restore_audio and audio_path and output_audio_path:
+        tts_candidates = [
+            s for s in processed
+            if s.get("restoration_tag") in ("inaudible", "noise")
+               or (
+                       s.get("restoration_method", "").startswith("llm_")
+                       and s.get("restoration_tag") not in ("assumption", "low_confidence")
+               )
+        ]
+        if tts_candidates:
+            log.info(
+                f"\n[TTS AUDIO RESTORATION] Synthesizing and splicing "
+                f"{len(tts_candidates)} fully-inaudible segment(s) into audio..."
+            )
+            _restore_audio_tts(processed, audio_path, output_audio_path, tts_language, log)
+        else:
+            log.info("No fully-inaudible segments found — audio unchanged.")
+            import shutil
+            shutil.copy(audio_path, output_audio_path)
+
+    # Step 5: Build full text
     full_text = _build_full_text(processed)
 
-    # Step 5: Statistics
+    # Step 6: Statistics
     total = len(processed)
     unclear_count = sum(1 for s in processed if s.get("is_unclear"))
     avg_conf = sum(s.get("confidence", 0) for s in processed) / max(total, 1)
@@ -80,25 +122,23 @@ def postprocess_transcript(
     return processed, full_text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Marking unclear segments
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _mark_unclear_segments(
-    segments: List[dict],
-    threshold: float,
-    log: logging.Logger,
+        segments: List[dict],
+        threshold: float,
+        log: logging.Logger,
 ) -> List[dict]:
-    """Mark segments as unclear based on confidence and heuristics."""
     result = []
 
     for seg in segments:
-        seg = dict(seg)  # copy
+        seg = dict(seg)
         text = seg.get("text", "").strip()
         confidence = seg.get("confidence", 1.0)
         no_speech_prob = seg.get("no_speech_prob", 0.0)
 
-        # Already marked unclear by ASR
         if seg.get("is_unclear", False):
             if not text or _is_noise_text(text):
                 seg["text"] = INAUDIBLE_TAG
@@ -107,18 +147,15 @@ def _mark_unclear_segments(
                 seg["text"] = INAUDIBLE_TAG
                 seg["restoration_tag"] = "inaudible"
             else:
-                # Wrap as assumption
                 clean_text = _clean_noise_artifacts(text)
                 seg["text"] = f"{ASSUMPTION_TAG} {clean_text}"
                 seg["restoration_tag"] = "assumption"
 
-        # Check for noise-only text
         elif _is_noise_text(text):
             seg["text"] = INAUDIBLE_TAG
             seg["is_unclear"] = True
             seg["restoration_tag"] = "noise"
 
-        # Low confidence but has text
         elif confidence < threshold:
             clean_text = _clean_noise_artifacts(text)
             if clean_text:
@@ -140,11 +177,10 @@ def _mark_unclear_segments(
 
 
 def _mark_unclear_words(
-    segments: List[dict],
-    confidence_threshold: float = 0.3,
-    log: logging.Logger = None,
+        segments: List[dict],
+        confidence_threshold: float = 0.3,
+        log: logging.Logger = None,
 ) -> List[dict]:
-    """Mark individual low-confidence words within segments."""
     result = []
 
     for seg in segments:
@@ -155,12 +191,10 @@ def _mark_unclear_words(
             result.append(seg)
             continue
 
-        # Check if segment already has unclear markers
         if INAUDIBLE_TAG in seg.get("text", "") or ASSUMPTION_TAG in seg.get("text", ""):
             result.append(seg)
             continue
 
-        # Rebuild text with word-level confidence markers
         new_words = []
         has_unclear_words = False
 
@@ -169,7 +203,6 @@ def _mark_unclear_words(
             word_conf = w.get("confidence", 1.0)
 
             if word_conf < confidence_threshold and word.strip():
-                # Very low confidence — mark as unclear
                 marked = w.copy()
                 marked["is_unclear"] = True
                 new_words.append(marked)
@@ -178,7 +211,6 @@ def _mark_unclear_words(
                 new_words.append(w)
 
         if has_unclear_words:
-            # Rebuild text with variant markers for unclear words
             text_parts = []
             for w in new_words:
                 word_text = w.get("word", "")
@@ -194,38 +226,42 @@ def _mark_unclear_words(
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # LLM restoration
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _llm_restore(
-    segments: List[dict],
-    provider: str,
-    language: str,
-    log: logging.Logger,
+        segments: List[dict],
+        provider: str,
+        language: str,
+        log: logging.Logger,
 ) -> List[dict]:
-    """Use LLM to restore unclear segments using surrounding context."""
-
-    # Get LLM function
     llm_fn = _get_llm_function(provider, log)
     if not llm_fn:
         log.warning("LLM not available, skipping restoration.")
         return segments
 
     result = list(segments)
+    _unclear_word_re = re.compile(r'\[[^\]]+\?\]')
 
-    # Process unclear segments with context window
     for i, seg in enumerate(result):
-        if not seg.get("is_unclear"):
+        seg_text = seg.get("text", "")
+
+        has_unclear_words = bool(_unclear_word_re.search(seg_text))
+        if not seg.get("is_unclear") and not has_unclear_words:
             continue
 
+        if has_unclear_words and not seg.get("is_unclear"):
+            seg = dict(seg)
+            seg["is_unclear"] = True
+            result[i] = seg
+
         if seg.get("text") == INAUDIBLE_TAG:
-            # Try to restore completely inaudible segment
             context_before = _get_context(result, i, window=3, before=True)
             context_after = _get_context(result, i, window=2, before=False)
 
             if not context_before and not context_after:
-                continue  # No context available
+                continue
 
             prompt = _build_restoration_prompt(
                 unclear_text="",
@@ -246,7 +282,6 @@ def _llm_restore(
                 log.warning(f"LLM restoration failed for segment {i}: {e}")
 
         elif ASSUMPTION_TAG in seg.get("text", "") or "[" in seg.get("text", ""):
-            # Try to clarify assumption
             raw_text = seg.get("text", "").replace(ASSUMPTION_TAG, "").strip()
             context_before = _get_context(result, i, window=3, before=True)
             context_after = _get_context(result, i, window=2, before=False)
@@ -273,15 +308,52 @@ def _llm_restore(
 
 
 def _get_llm_function(provider: str, log: logging.Logger):
-    """Get LLM callable based on provider."""
+    if provider == "local":
+        return _get_local_llm_fn(log)
 
-    if provider == "openai":
+    elif provider in ("claude", "anthropic"):
+        import requests as _requests
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            log.warning("ANTHROPIC_API_KEY not set. Falling back to local LLM.")
+            return _get_local_llm_fn(log)
+
+        def call_claude(prompt: str) -> str:
+            response = _requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 200,
+                    "system": (
+                        "You are a professional transcription editor. "
+                        "Restore unclear speech based on context. "
+                        "Return ONLY the restored text, no explanations, no preamble."
+                    ),
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    return block["text"].strip()
+            return ""
+
+        return call_claude
+
+    elif provider == "openai":
         try:
             import openai
             api_key = os.environ.get("OPENAI_API_KEY")
             if not api_key:
-                log.warning("OPENAI_API_KEY not set.")
-                return None
+                log.warning("OPENAI_API_KEY not set. Falling back to local LLM.")
+                return _get_local_llm_fn(log)
 
             client = openai.OpenAI(api_key=api_key)
 
@@ -289,7 +361,11 @@ def _get_llm_function(provider: str, log: logging.Logger):
                 response = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {"role": "system", "content": "You are a professional transcription editor. Restore unclear speech based on context. Return ONLY the restored text, no explanations."},
+                        {"role": "system", "content": (
+                            "You are a professional transcription editor. "
+                            "Restore unclear speech based on context. "
+                            "Return ONLY the restored text, no explanations."
+                        )},
                         {"role": "user", "content": prompt},
                     ],
                     max_tokens=200,
@@ -299,69 +375,467 @@ def _get_llm_function(provider: str, log: logging.Logger):
 
             return call_openai
         except ImportError:
-            log.warning("openai package not installed.")
+            log.warning("openai package not installed. Falling back to local LLM.")
+            return _get_local_llm_fn(log)
+
+    return _get_local_llm_fn(log)
+
+
+def _get_local_llm_fn(log: logging.Logger):
+    import requests as _requests
+
+    base_url = os.environ.get("LOCAL_LLM_URL", "http://localhost:11434/v1")
+    model = os.environ.get("LOCAL_LLM_MODEL", "")
+
+    if not model:
+        model = _detect_ollama_model(base_url, log)
+        if not model:
+            log.warning(
+                "No local LLM model found. "
+                "Install Ollama (https://ollama.com) and run: ollama pull qwen2.5:7b"
+            )
             return None
 
-    elif provider == "anthropic":
-        try:
-            import anthropic
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                log.warning("ANTHROPIC_API_KEY not set.")
-                return None
+    log.info(f"Local LLM: {base_url}, model={model}")
 
-            client = anthropic.Anthropic(api_key=api_key)
+    ollama_base = base_url.replace("/v1", "")
+    try:
+        ping = _requests.get(f"{ollama_base}/api/version", timeout=5)
+        if ping.status_code != 200:
+            raise ConnectionError(f"Ollama ping returned {ping.status_code}")
+        log.info(f"Ollama is running (version: {ping.json().get('version', '?')})")
+    except Exception as e:
+        log.warning(f"Cannot reach Ollama at {ollama_base}: {e}")
+        return None
 
-            def call_anthropic(prompt: str) -> str:
-                message = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=200,
-                    system="You are a professional transcription editor. Restore unclear speech based on context. Return ONLY the restored text, no explanations.",
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return message.content[0].text.strip()
+    _TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", "300"))
 
-            return call_anthropic
-        except ImportError:
-            log.warning("anthropic package not installed.")
-            return None
-
-    elif provider == "local":
-        # Try Ollama or local OpenAI-compatible endpoint
-        try:
-            import requests
-            base_url = os.environ.get("LOCAL_LLM_URL", "http://localhost:11434/v1")
-
-            def call_local(prompt: str) -> str:
-                resp = requests.post(
-                    f"{base_url}/chat/completions",
-                    json={
-                        "model": os.environ.get("LOCAL_LLM_MODEL", "llama3"),
-                        "messages": [
-                            {"role": "system", "content": "Restore unclear speech from context. Return only the text."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": 200,
-                        "temperature": 0.3,
+    def call_local(prompt: str) -> str:
+        resp = _requests.post(
+            f"{base_url}/chat/completions",
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a professional transcription editor. "
+                            "Restore unclear speech based on context. "
+                            "Return ONLY the restored text, no explanations, no preamble."
+                        ),
                     },
-                    timeout=30,
-                )
-                return resp.json()["choices"][0]["message"]["content"].strip()
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 200,
+                "temperature": 0.3,
+                "stream": False,
+            },
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
-            return call_local
-        except Exception as e:
-            log.warning(f"Local LLM not available: {e}")
-            return None
+    return call_local
+
+
+def _detect_ollama_model(base_url: str, log: logging.Logger) -> str:
+    import requests as _requests
+
+    ollama_base = base_url.replace("/v1", "")
+    preferred = ["qwen2.5", "gemma3", "mistral", "llama3", "phi3", "llama2"]
+
+    try:
+        resp = _requests.get(f"{ollama_base}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            models = [m["name"] for m in resp.json().get("models", [])]
+            if models:
+                log.info(f"Ollama installed models: {', '.join(models)}")
+                for pref in preferred:
+                    for m in models:
+                        if m.startswith(pref):
+                            return m
+                return models[0]
+    except Exception:
+        pass
+
+    try:
+        resp = _requests.get(f"{base_url}/models", timeout=5)
+        if resp.status_code == 200:
+            models = [m["id"] for m in resp.json().get("data", [])]
+            if models:
+                log.info(f"Available models: {', '.join(models)}")
+                for pref in preferred:
+                    for m in models:
+                        if pref in m:
+                            return m
+                return models[0]
+    except Exception:
+        pass
+
+    return ""
+
+
+# =============================================================================
+# TTS audio restoration
+# =============================================================================
+
+def _restore_audio_tts(
+        segments: List[dict],
+        source_audio_path: str,
+        output_audio_path: str,
+        tts_language: str,
+        log: logging.Logger,
+):
+    """
+    Splice TTS audio only for fully inaudible segments.
+    Segments tagged assumption/low_confidence are SKIPPED — original audio is kept.
+    """
+    import numpy as np
+    import scipy.io.wavfile as wav_io
+    import tempfile
+
+    log.info(f"Loading source audio: {source_audio_path}")
+    sr, data = wav_io.read(source_audio_path)
+
+    if data.dtype == np.int16:
+        audio = data.astype(np.float32) / 32768.0
+    elif data.dtype == np.int32:
+        audio = data.astype(np.float32) / 2147483648.0
+    else:
+        audio = data.astype(np.float32)
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    tts_fn = _get_tts_function(tts_language, log)
+    if not tts_fn:
+        log.warning("No TTS backend available. Skipping audio restoration.")
+        return
+
+    restored_count = 0
+    _variant_re = re.compile(r'\[([^/\]]+)/[^\]]+\]')
+    _unclear_word_re2 = re.compile(r'\[([^\]]+)\?\]')
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for seg in segments:
+            seg_text_raw = seg.get("text", "")
+            restoration_tag = seg.get("restoration_tag", "")
+
+            # SKIP partial-speech segments — do not overwrite audible speech
+            if restoration_tag in ("assumption", "low_confidence"):
+                log.info(
+                    f"  Segment {seg.get('id','?')} ({seg.get('start',0):.1f}s): "
+                    f"partial speech present (tag={restoration_tag}) — keeping original audio."
+                )
+                continue
+
+            was_llm_restored = seg.get("restoration_method", "").startswith("llm_")
+            is_inaudible = restoration_tag in ("inaudible", "noise")
+
+            if not was_llm_restored and not is_inaudible:
+                continue
+
+            # Build clean text for TTS (strip all tags/brackets)
+            text = seg_text_raw
+            text = text.replace(ASSUMPTION_TAG, "").replace(INAUDIBLE_TAG, "").strip()
+            text = _variant_re.sub(r'\1', text)       # [A/B] → A
+            text = _unclear_word_re2.sub(r'\1', text)  # [word?] → word
+            text = re.sub(r'[\[\]]', '', text).strip() # remove remaining brackets
+
+            if not text:
+                log.info(
+                    f"  Segment {seg.get('id','?')} ({seg.get('start',0):.1f}s): "
+                    f"fully inaudible, silence kept."
+                )
+                continue
+
+            # Determine precise splice start using word timestamps
+            seg_start_raw = seg.get("start", 0.0)
+            seg_end = seg.get("end", 0.0)
+            words = seg.get("words", [])
+
+            seg_start = seg_start_raw
+            if words:
+                unclear_words = [w for w in words if w.get("is_unclear", False)]
+                if unclear_words:
+                    seg_start = unclear_words[0].get("start", seg_start_raw)
+                    log.info(
+                        f"  Segment {seg.get('id','?')}: adjusted start "
+                        f"{seg_start_raw:.3f}s -> {seg_start:.3f}s (first unclear word)"
+                    )
+
+            seg_duration = seg_end - seg_start
+            if seg_duration <= 0.05:
+                continue
+
+            # Synthesize TTS
+            tts_wav = os.path.join(tmpdir, f"tts_{seg.get('id', restored_count)}.wav")
+            try:
+                tts_fn(text, tts_wav)
+            except Exception as e:
+                log.warning(f"TTS synthesis failed for segment {seg.get('id','?')}: {e}")
+                continue
+
+            if not os.path.exists(tts_wav) or os.path.getsize(tts_wav) == 0:
+                continue
+
+            tts_sr, tts_data = wav_io.read(tts_wav)
+            if tts_data.dtype == np.int16:
+                tts_audio = tts_data.astype(np.float32) / 32768.0
+            else:
+                tts_audio = tts_data.astype(np.float32)
+
+            if tts_audio.ndim > 1:
+                tts_audio = tts_audio.mean(axis=1)
+
+            if tts_sr != sr:
+                tts_audio = _resample(tts_audio, tts_sr, sr)
+
+            tts_len = len(tts_audio)
+            target_samples = int(seg_duration * sr)
+            ratio = tts_len / max(target_samples, 1)
+
+            log.info(
+                f"  Segment {seg.get('id','?')} slot={seg_duration:.2f}s, "
+                f"TTS={tts_len/sr:.2f}s, ratio={ratio:.2f}"
+            )
+
+            # Fit TTS into the slot
+            if ratio <= 1.25:
+                if tts_len < target_samples:
+                    tts_audio = np.pad(tts_audio, (0, target_samples - tts_len))
+                else:
+                    tts_audio = tts_audio[:target_samples]
+            else:
+                stretched = _pitch_preserving_stretch(tts_audio, sr, target_samples, log)
+                if stretched is not None:
+                    tts_audio = stretched
+                    log.info(f"  Used pitch-preserving stretch (ratio={ratio:.2f})")
+                else:
+                    log.info(
+                        f"  TTS longer than slot by {(tts_len-target_samples)/sr:.2f}s "
+                        f"— inserting at natural length"
+                    )
+                    splice_start = int(seg_start * sr)
+                    gap_end = int(seg_end * sr)
+                    tail = audio[gap_end:].copy()
+                    audio = np.concatenate([audio[:splice_start], tts_audio, tail])
+                    restored_count += 1
+                    log.info(
+                        f"  Spliced TTS for segment {seg.get('id','?')} "
+                        f"({seg_start:.1f}s): \"{text[:50]}\""
+                    )
+                    continue
+
+            # Fade in/out to avoid clicks (10ms)
+            fade_samples = min(int(0.010 * sr), len(tts_audio) // 4)
+            if fade_samples > 0:
+                fade = np.linspace(0, 1, fade_samples)
+                tts_audio[:fade_samples] *= fade
+                tts_audio[-fade_samples:] *= fade[::-1]
+
+            # Match volume to surrounding audio
+            start_sample = int(seg_start * sr)
+            end_sample = min(int(seg_end * sr), len(audio))
+            if end_sample > start_sample and end_sample <= len(audio):
+                source_rms = np.sqrt(np.mean(audio[start_sample:end_sample] ** 2))
+                tts_rms = np.sqrt(np.mean(tts_audio ** 2))
+                if tts_rms > 1e-6 and source_rms > 1e-6:
+                    tts_audio = tts_audio * (source_rms / tts_rms)
+
+            # Splice
+            splice_start = int(seg_start * sr)
+            splice_end = splice_start + len(tts_audio)
+
+            if splice_end > len(audio):
+                audio = np.pad(audio, (0, splice_end - len(audio)))
+
+            audio[splice_start:splice_end] = tts_audio
+            restored_count += 1
+            log.info(
+                f"  Spliced TTS for segment {seg.get('id','?')} "
+                f"({seg_start:.1f}s-{seg_end:.1f}s): \"{text[:40]}\""
+            )
+
+    if restored_count == 0:
+        log.warning("No segments spliced — copying source audio unchanged.")
+        import shutil
+        shutil.copy(source_audio_path, output_audio_path)
+        return
+
+    audio_out = np.clip(audio, -1.0, 1.0)
+    audio_int16 = (audio_out * 32767).astype(np.int16)
+    wav_io.write(output_audio_path, sr, audio_int16)
+    log.info(f"Restored audio saved: {output_audio_path} ({restored_count} segments spliced)")
+
+
+def _get_tts_function(language: str, log: logging.Logger):
+    """Return a TTS function: tts_fn(text, output_wav_path)."""
+
+    # edge-tts: Microsoft Neural TTS — best quality, free, needs internet
+    try:
+        import edge_tts
+        import asyncio
+        import subprocess
+
+        EDGE_VOICES = {
+            "ru": "ru-RU-SvetlanaNeural",
+            "en": "en-US-JennyNeural",
+            "de": "de-DE-KatjaNeural",
+            "fr": "fr-FR-DeniseNeural",
+            "uk": "uk-UA-PolinaNeural",
+        }
+        voice = EDGE_VOICES.get(language, "en-US-JennyNeural")
+
+        def edge_synthesize(text: str, output_wav: str):
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tmp_mp3 = f.name
+            try:
+                async def _run():
+                    communicate = edge_tts.Communicate(text, voice)
+                    await communicate.save(tmp_mp3)
+
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_run())
+                finally:
+                    loop.close()
+
+                # Convert MP3 -> WAV and trim leading silence
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", tmp_mp3,
+                        "-af", "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-50dB",
+                        "-ar", "16000", "-ac", "1",
+                        "-acodec", "pcm_s16le", output_wav,
+                    ],
+                    capture_output=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffmpeg failed: {result.stderr[-300:]}")
+            finally:
+                if os.path.exists(tmp_mp3):
+                    os.unlink(tmp_mp3)
+
+        log.info(f"TTS backend: edge-tts (Microsoft Neural, voice={voice})")
+        return edge_synthesize
+    except ImportError:
+        log.info("edge-tts not available, trying gTTS...")
+
+    # gTTS fallback
+    try:
+        from gtts import gTTS
+        import subprocess
+
+        def gtts_synthesize(text: str, output_wav: str):
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tmp_mp3 = f.name
+            try:
+                tts = gTTS(text=text, lang=language, slow=False)
+                tts.save(tmp_mp3)
+                # Trim leading silence that causes the ~1s delay
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", tmp_mp3,
+                        "-af", "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-50dB",
+                        "-ar", "16000", "-ac", "1",
+                        "-acodec", "pcm_s16le", output_wav,
+                    ],
+                    capture_output=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffmpeg MP3->WAV failed: {result.stderr[-300:]}")
+            finally:
+                if os.path.exists(tmp_mp3):
+                    os.unlink(tmp_mp3)
+
+        log.info("TTS backend: gTTS (Google TTS)")
+        return gtts_synthesize
+    except ImportError:
+        log.info("gTTS not available, trying pyttsx3...")
+
+    # pyttsx3 offline fallback
+    try:
+        import pyttsx3
+
+        engine = pyttsx3.init()
+        voices = engine.getProperty("voices")
+        for v in voices:
+            if language.lower() in (v.languages or []) or language in v.id.lower():
+                engine.setProperty("voice", v.id)
+                break
+        engine.setProperty("rate", 160)
+
+        def pyttsx3_synthesize(text: str, output_wav: str):
+            engine.save_to_file(text, output_wav)
+            engine.runAndWait()
+
+        log.info("TTS backend: pyttsx3 (offline)")
+        return pyttsx3_synthesize
+    except ImportError:
+        log.warning("No TTS backend found. Install: pip install edge-tts")
+        return None
+
+
+def _resample(audio: "np.ndarray", from_sr: int, to_sr: int) -> "np.ndarray":
+    import numpy as np
+    if from_sr == to_sr:
+        return audio
+    try:
+        import scipy.signal
+        n_samples = int(len(audio) * to_sr / from_sr)
+        return scipy.signal.resample(audio, n_samples).astype(np.float32)
+    except Exception:
+        return audio
+
+
+def _pitch_preserving_stretch(
+        audio: "np.ndarray",
+        sr: int,
+        target_len: int,
+        log: "logging.Logger",
+) -> "Optional[np.ndarray]":
+    import numpy as np
+
+    if len(audio) == target_len:
+        return audio
+
+    rate = len(audio) / max(target_len, 1)
+
+    if rate > 2.0:
+        log.info(f"  Stretch ratio {rate:.2f} too extreme — skipping stretch")
+        return None
+
+    try:
+        import librosa
+        stretched = librosa.effects.time_stretch(audio.astype(np.float32), rate=rate)
+        if len(stretched) > target_len:
+            stretched = stretched[:target_len]
+        elif len(stretched) < target_len:
+            stretched = np.pad(stretched, (0, target_len - len(stretched)))
+        return stretched.astype(np.float32)
+    except ImportError:
+        pass
+    except Exception as e:
+        log.debug(f"librosa stretch failed: {e}")
 
     return None
 
 
+# =============================================================================
+# Prompt builder
+# =============================================================================
+
 def _build_restoration_prompt(
-    unclear_text: str,
-    context_before: str,
-    context_after: str,
-    language: str,
-    is_completely_inaudible: bool = False,
+        unclear_text: str,
+        context_before: str,
+        context_after: str,
+        language: str,
+        is_completely_inaudible: bool = False,
 ) -> str:
     lang_name = {
         "ru": "Russian", "en": "English", "de": "German",
@@ -369,36 +843,35 @@ def _build_restoration_prompt(
     }.get(language, language)
 
     if is_completely_inaudible:
-        return f"""Audio segment is completely inaudible. Using context to suggest what was likely said.
-Language: {lang_name}
-
-Context before: "{context_before}"
-Context after: "{context_after}"
-
-Based on this context, what short phrase (1-10 words) was most likely said in the missing segment?
-Respond ONLY with the most probable text. If impossible to determine, respond with exactly: [неразборчиво]"""
+        return (
+            f"Audio segment is completely inaudible. Using context to suggest what was likely said.\n"
+            f"Language: {lang_name}\n\n"
+            f"Context before: \"{context_before}\"\n"
+            f"Context after: \"{context_after}\"\n\n"
+            f"Based on this context, what short phrase (1-10 words) was most likely said in the missing segment?\n"
+            f"Respond ONLY with the most probable text. If impossible to determine, respond with exactly: [неразборчиво]"
+        )
     else:
-        return f"""Audio transcription contains unclear speech marked with [?] or [предположение].
-Language: {lang_name}
-
-Context before: "{context_before}"
-Unclear text: "{unclear_text}"
-Context after: "{context_after}"
-
-Correct the unclear text based on context. Rules:
-- Return ONLY corrected text, no explanation
-- Keep close to original if reasonable
-- If multiple options exist, use format: [вариант1/вариант2]
-- If truly impossible, return: [неразборчиво]"""
+        return (
+            f"Audio transcription contains unclear speech marked with [?] or [предположение].\n"
+            f"Language: {lang_name}\n\n"
+            f"Context before: \"{context_before}\"\n"
+            f"Unclear text: \"{unclear_text}\"\n"
+            f"Context after: \"{context_after}\"\n\n"
+            f"Correct the unclear text based on context. Rules:\n"
+            f"- Return ONLY corrected text, no explanation\n"
+            f"- Keep close to original if reasonable\n"
+            f"- If multiple options exist, use format: [вариант1/вариант2]\n"
+            f"- If truly impossible, return: [неразборчиво]"
+        )
 
 
 def _get_context(
-    segments: List[dict],
-    index: int,
-    window: int,
-    before: bool,
+        segments: List[dict],
+        index: int,
+        window: int,
+        before: bool,
 ) -> str:
-    """Get text context around a segment."""
     texts = []
 
     if before:
@@ -421,12 +894,11 @@ def _get_context(
     return " ".join(texts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Build full text
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _build_full_text(segments: List[dict]) -> str:
-    """Build full transcript text with timestamps header."""
     lines = []
     lines.append("TRANSCRIPT\n" + "=" * 60 + "\n")
 
@@ -446,7 +918,6 @@ def _build_full_text(segments: List[dict]) -> str:
 
     full_text = "\n".join(lines)
 
-    # Also add clean transcript at the end
     lines.append("\n" + "=" * 60)
     lines.append("CLEAN TRANSCRIPT (no timestamps)\n" + "=" * 60 + "\n")
 
@@ -461,32 +932,29 @@ def _build_full_text(segments: List[dict]) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Text cleaning utilities
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
-# Common noise/artifact patterns from Whisper
 _NOISE_PATTERNS = [
-    r"^\s*$",                           # empty
-    r"^\s*\.\s*$",                      # just a dot
-    r"^\s*\[.*\]\s*$",                  # just brackets
-    r"(?i)^\s*(uh+|um+|hmm+|mm+)\s*$", # filler sounds
-    r"(?i)^\s*(music|музыка|♪|♫)\s*$",  # music annotations
-    r"(?i)^\s*\[.*?(noise|шум|нрзб).*?\]\s*$",  # noise markers
-    r"^\s*[.!?,;:]+\s*$",              # just punctuation
+    r"^\s*$",
+    r"^\s*\.\s*$",
+    r"^\s*\[.*\]\s*$",
+    r"(?i)^\s*(uh+|um+|hmm+|mm+)\s*$",
+    r"(?i)^\s*(music|музыка|♪|♫)\s*$",
+    r"(?i)^\s*\[.*?(noise|шум|нрзб).*?\]\s*$",
+    r"^\s*[.!?,;:]+\s*$",
 ]
 
 _NOISE_RE = [re.compile(p) for p in _NOISE_PATTERNS]
 
 
 def _is_noise_text(text: str) -> bool:
-    """Check if text is just noise/artifact."""
     if not text:
         return True
     for pattern in _NOISE_RE:
         if pattern.match(text):
             return True
-    # Very short suspicious text
     clean = re.sub(r'[^a-zA-Zа-яА-Я]', '', text)
     if len(clean) <= 1 and len(text) > 0:
         return True
@@ -494,18 +962,13 @@ def _is_noise_text(text: str) -> bool:
 
 
 def _clean_noise_artifacts(text: str) -> str:
-    """Remove common Whisper hallucination patterns."""
-    # Remove annotation brackets that whisper sometimes adds
     text = re.sub(r'\[(?:музыка|music|аплодисменты|applause|смех|laughter)\]', '', text, flags=re.IGNORECASE)
-    # Remove duplicate punctuation
     text = re.sub(r'([.!?])\1+', r'\1', text)
-    # Normalize spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
 def _fmt_time(seconds: float) -> str:
-    """Format seconds as HH:MM:SS.mmm"""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
