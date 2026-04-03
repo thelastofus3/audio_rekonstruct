@@ -83,23 +83,25 @@ def postprocess_transcript(
         else:
             log.info("No unclear segments for LLM restoration.")
 
-    # Step 4: TTS audio restoration — splice synthesized speech into audio file
+    # Step 4: TTS audio restoration
+    # Only for fully inaudible segments ([неразборчиво]), NOT for [предположение]
     if restore_audio and audio_path and output_audio_path:
-        _unclear_re = re.compile(r'\[[^\]]+\?\]')
         tts_candidates = [
             s for s in processed
-            if s.get("restoration_method", "").startswith("llm_")
-               or ASSUMPTION_TAG in s.get("text", "")
-               or bool(_unclear_re.search(s.get("text", "")))
+            if s.get("restoration_tag") in ("inaudible", "noise")
+               or (
+                       s.get("restoration_method", "").startswith("llm_")
+                       and s.get("restoration_tag") not in ("assumption", "low_confidence")
+               )
         ]
         if tts_candidates:
             log.info(
                 f"\n[TTS AUDIO RESTORATION] Synthesizing and splicing "
-                f"{len(tts_candidates)} segment(s) into audio..."
+                f"{len(tts_candidates)} fully-inaudible segment(s) into audio..."
             )
             _restore_audio_tts(processed, audio_path, output_audio_path, tts_language, log)
         else:
-            log.info("No unclear segments found — audio unchanged.")
+            log.info("No fully-inaudible segments found — audio unchanged.")
             import shutil
             shutil.copy(audio_path, output_audio_path)
 
@@ -120,25 +122,23 @@ def postprocess_transcript(
     return processed, full_text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Marking unclear segments
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _mark_unclear_segments(
         segments: List[dict],
         threshold: float,
         log: logging.Logger,
 ) -> List[dict]:
-    """Mark segments as unclear based on confidence and heuristics."""
     result = []
 
     for seg in segments:
-        seg = dict(seg)  # copy
+        seg = dict(seg)
         text = seg.get("text", "").strip()
         confidence = seg.get("confidence", 1.0)
         no_speech_prob = seg.get("no_speech_prob", 0.0)
 
-        # Already marked unclear by ASR
         if seg.get("is_unclear", False):
             if not text or _is_noise_text(text):
                 seg["text"] = INAUDIBLE_TAG
@@ -181,7 +181,6 @@ def _mark_unclear_words(
         confidence_threshold: float = 0.3,
         log: logging.Logger = None,
 ) -> List[dict]:
-    """Mark individual low-confidence words within segments."""
     result = []
 
     for seg in segments:
@@ -227,9 +226,9 @@ def _mark_unclear_words(
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # LLM restoration
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _llm_restore(
         segments: List[dict],
@@ -237,29 +236,21 @@ def _llm_restore(
         language: str,
         log: logging.Logger,
 ) -> List[dict]:
-    """Use LLM to restore unclear segments using surrounding context."""
-
     llm_fn = _get_llm_function(provider, log)
     if not llm_fn:
         log.warning("LLM not available, skipping restoration.")
         return segments
 
     result = list(segments)
-
-    # Regex to detect word-level unclear markers like [Listen,?] or [word?]
     _unclear_word_re = re.compile(r'\[[^\]]+\?\]')
 
     for i, seg in enumerate(result):
         seg_text = seg.get("text", "")
 
-        # Process segment if:
-        #   a) flagged as unclear by ASR confidence, OR
-        #   b) contains word-level markers like [word?] even if overall confidence was OK
         has_unclear_words = bool(_unclear_word_re.search(seg_text))
         if not seg.get("is_unclear") and not has_unclear_words:
             continue
 
-        # If segment has word-level markers, treat as assumption (not fully inaudible)
         if has_unclear_words and not seg.get("is_unclear"):
             seg = dict(seg)
             seg["is_unclear"] = True
@@ -317,15 +308,6 @@ def _llm_restore(
 
 
 def _get_llm_function(provider: str, log: logging.Logger):
-    """
-    Get LLM callable based on provider.
-
-    Providers:
-      "local"     — Ollama running locally (FREE, no key needed) — DEFAULT
-      "openai"    — OpenAI API (requires OPENAI_API_KEY)
-      "claude"    — Anthropic Claude API (requires ANTHROPIC_API_KEY)
-    """
-
     if provider == "local":
         return _get_local_llm_fn(log)
 
@@ -400,27 +382,11 @@ def _get_llm_function(provider: str, log: logging.Logger):
 
 
 def _get_local_llm_fn(log: logging.Logger):
-    """
-    Connect to a locally running LLM via Ollama (recommended) or any
-    OpenAI-compatible server (LM Studio, llama.cpp, etc.).
-
-    Setup (one-time):
-      1. Install Ollama: https://ollama.com
-      2. Pull a model:
-           ollama pull gemma3          # good for Russian (~5 GB)
-           ollama pull qwen2.5:7b      # excellent multilingual (~5 GB)
-           ollama pull mistral         # good English (~4 GB)
-      3. Ollama starts automatically — no extra commands needed.
-
-    Custom server URL: set LOCAL_LLM_URL env var (default: http://localhost:11434/v1)
-    Custom model:      set LOCAL_LLM_MODEL env var  (default: auto-detect from Ollama)
-    """
     import requests as _requests
 
     base_url = os.environ.get("LOCAL_LLM_URL", "http://localhost:11434/v1")
     model = os.environ.get("LOCAL_LLM_MODEL", "")
 
-    # Auto-detect available model from Ollama if model not specified
     if not model:
         model = _detect_ollama_model(base_url, log)
         if not model:
@@ -431,9 +397,7 @@ def _get_local_llm_fn(log: logging.Logger):
             return None
 
     log.info(f"Local LLM: {base_url}, model={model}")
-    log.info("Note: first request may take 30-120s while model loads into memory.")
 
-    # Verify Ollama is reachable via lightweight ping (no model inference)
     ollama_base = base_url.replace("/v1", "")
     try:
         ping = _requests.get(f"{ollama_base}/api/version", timeout=5)
@@ -442,11 +406,8 @@ def _get_local_llm_fn(log: logging.Logger):
         log.info(f"Ollama is running (version: {ping.json().get('version', '?')})")
     except Exception as e:
         log.warning(f"Cannot reach Ollama at {ollama_base}: {e}")
-        log.warning("Make sure Ollama is running. Start it with: ollama serve")
         return None
 
-    # Timeout 300s — model cold-start on CPU can take 1-2 min
-    # Override with: set LOCAL_LLM_TIMEOUT=600
     _TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", "300"))
 
     def call_local(prompt: str) -> str:
@@ -478,13 +439,8 @@ def _get_local_llm_fn(log: logging.Logger):
 
 
 def _detect_ollama_model(base_url: str, log: logging.Logger) -> str:
-    """
-    Ask Ollama which models are installed and pick the best one for transcription.
-    Preferred order: qwen2.5, gemma3, mistral, llama3, phi3 — any available.
-    """
     import requests as _requests
 
-    # Ollama-specific models list endpoint
     ollama_base = base_url.replace("/v1", "")
     preferred = ["qwen2.5", "gemma3", "mistral", "llama3", "phi3", "llama2"]
 
@@ -494,16 +450,14 @@ def _detect_ollama_model(base_url: str, log: logging.Logger) -> str:
             models = [m["name"] for m in resp.json().get("models", [])]
             if models:
                 log.info(f"Ollama installed models: {', '.join(models)}")
-                # Pick by preference
                 for pref in preferred:
                     for m in models:
                         if m.startswith(pref):
                             return m
-                return models[0]  # just use whatever is installed
+                return models[0]
     except Exception:
         pass
 
-    # Fallback: try OpenAI-compatible /models endpoint
     try:
         resp = _requests.get(f"{base_url}/models", timeout=5)
         if resp.status_code == 200:
@@ -521,6 +475,9 @@ def _detect_ollama_model(base_url: str, log: logging.Logger) -> str:
     return ""
 
 
+# =============================================================================
+# TTS audio restoration
+# =============================================================================
 
 def _restore_audio_tts(
         segments: List[dict],
@@ -530,18 +487,11 @@ def _restore_audio_tts(
         log: logging.Logger,
 ):
     """
-    For each LLM-restored segment, synthesize speech via TTS and splice it
-    back into the source audio at the correct timestamp.
-
-    Requires at least one TTS backend:
-      - gtts  (pip install gtts)   — free, needs internet, good quality
-      - pyttsx3 (pip install pyttsx3) — offline, system voices
-
-    Output is saved to output_audio_path.
+    Splice TTS audio only for fully inaudible segments.
+    Segments tagged assumption/low_confidence are SKIPPED — original audio is kept.
     """
     import numpy as np
     import scipy.io.wavfile as wav_io
-    from pathlib import Path
     import tempfile
 
     log.info(f"Loading source audio: {source_audio_path}")
@@ -563,56 +513,72 @@ def _restore_audio_tts(
         return
 
     restored_count = 0
-
     _variant_re = re.compile(r'\[([^/\]]+)/[^\]]+\]')
     _unclear_word_re2 = re.compile(r'\[([^\]]+)\?\]')
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for seg in segments:
             seg_text_raw = seg.get("text", "")
+            restoration_tag = seg.get("restoration_tag", "")
 
-            # Process segment if LLM restored it OR if it still has unclear word markers
-            was_llm_restored = seg.get("restoration_method", "").startswith("llm_")
-            has_unclear_markers = (
-                    INAUDIBLE_TAG in seg_text_raw
-                    or ASSUMPTION_TAG in seg_text_raw
-                    or bool(_unclear_word_re2.search(seg_text_raw))
-            )
-            if not was_llm_restored and not has_unclear_markers:
+            # SKIP partial-speech segments — do not overwrite audible speech
+            if restoration_tag in ("assumption", "low_confidence"):
+                log.info(
+                    f"  Segment {seg.get('id','?')} ({seg.get('start',0):.1f}s): "
+                    f"partial speech present (tag={restoration_tag}) — keeping original audio."
+                )
                 continue
 
-            # Build clean text for TTS
+            was_llm_restored = seg.get("restoration_method", "").startswith("llm_")
+            is_inaudible = restoration_tag in ("inaudible", "noise")
+
+            if not was_llm_restored and not is_inaudible:
+                continue
+
+            # Build clean text for TTS (strip all tags/brackets)
             text = seg_text_raw
             text = text.replace(ASSUMPTION_TAG, "").replace(INAUDIBLE_TAG, "").strip()
-            # [вариантA/вариантB] → pick first variant
-            text = _variant_re.sub(r'\1', text)
-            # [слово?] → keep the word
-            text = _unclear_word_re2.sub(r'\1', text)
-            text = text.strip()
+            text = _variant_re.sub(r'\1', text)       # [A/B] → A
+            text = _unclear_word_re2.sub(r'\1', text)  # [word?] → word
+            text = re.sub(r'[\[\]]', '', text).strip() # remove remaining brackets
 
             if not text:
-                log.info(f"  Segment {seg['id']} ({seg.get('start',0):.1f}s): fully inaudible, silence kept.")
+                log.info(
+                    f"  Segment {seg.get('id','?')} ({seg.get('start',0):.1f}s): "
+                    f"fully inaudible, silence kept."
+                )
                 continue
 
-            seg_start = seg.get("start", 0.0)
+            # Determine precise splice start using word timestamps
+            seg_start_raw = seg.get("start", 0.0)
             seg_end = seg.get("end", 0.0)
-            seg_duration = seg_end - seg_start
+            words = seg.get("words", [])
 
+            seg_start = seg_start_raw
+            if words:
+                unclear_words = [w for w in words if w.get("is_unclear", False)]
+                if unclear_words:
+                    seg_start = unclear_words[0].get("start", seg_start_raw)
+                    log.info(
+                        f"  Segment {seg.get('id','?')}: adjusted start "
+                        f"{seg_start_raw:.3f}s -> {seg_start:.3f}s (first unclear word)"
+                    )
+
+            seg_duration = seg_end - seg_start
             if seg_duration <= 0.05:
                 continue
 
-            # Synthesize to temp WAV
-            tts_wav = os.path.join(tmpdir, f"tts_{seg['id']}.wav")
+            # Synthesize TTS
+            tts_wav = os.path.join(tmpdir, f"tts_{seg.get('id', restored_count)}.wav")
             try:
                 tts_fn(text, tts_wav)
             except Exception as e:
-                log.warning(f"TTS synthesis failed for segment {seg['id']}: {e}")
+                log.warning(f"TTS synthesis failed for segment {seg.get('id','?')}: {e}")
                 continue
 
             if not os.path.exists(tts_wav) or os.path.getsize(tts_wav) == 0:
                 continue
 
-            # Load TTS audio and resample to match source SR
             tts_sr, tts_data = wav_io.read(tts_wav)
             if tts_data.dtype == np.int16:
                 tts_audio = tts_data.astype(np.float32) / 32768.0
@@ -622,7 +588,6 @@ def _restore_audio_tts(
             if tts_audio.ndim > 1:
                 tts_audio = tts_audio.mean(axis=1)
 
-            # Resample TTS to source SR if needed
             if tts_sr != sr:
                 tts_audio = _resample(tts_audio, tts_sr, sr)
 
@@ -631,63 +596,45 @@ def _restore_audio_tts(
             ratio = tts_len / max(target_samples, 1)
 
             log.info(
-                f"  Segment {seg['id']} slot={seg_duration:.2f}s, "
+                f"  Segment {seg.get('id','?')} slot={seg_duration:.2f}s, "
                 f"TTS={tts_len/sr:.2f}s, ratio={ratio:.2f}"
             )
 
-            # ── Time-stretch TTS to fit the gap without changing pitch ────────
-            # Strategy:
-            #   ratio <= 1.25 : TTS fits or is slightly longer → pad/trim silently
-            #   ratio  > 1.25 : TTS is much longer than slot →
-            #       try librosa PSOLA (pitch-preserving), fallback to
-            #       shifting the rest of the audio to make room (natural result)
+            # Fit TTS into the slot
             if ratio <= 1.25:
-                # TTS fits within slot (or barely over) — pad with silence or trim
                 if tts_len < target_samples:
-                    # Pad end with silence to fill slot
                     tts_audio = np.pad(tts_audio, (0, target_samples - tts_len))
                 else:
-                    # Trim to slot (ratio ≤ 1.25, so at most ~100ms clipped)
                     tts_audio = tts_audio[:target_samples]
             else:
-                # TTS is significantly longer than the original gap.
-                # Try pitch-preserving stretch first (librosa), otherwise
-                # just insert at natural length (shifts subsequent audio).
                 stretched = _pitch_preserving_stretch(tts_audio, sr, target_samples, log)
                 if stretched is not None:
                     tts_audio = stretched
                     log.info(f"  Used pitch-preserving stretch (ratio={ratio:.2f})")
                 else:
-                    # Insert at natural TTS length — audio after this point
-                    # will be shifted right by (tts_len - target_samples) samples.
                     log.info(
                         f"  TTS longer than slot by {(tts_len-target_samples)/sr:.2f}s "
-                        f"— inserting at natural length (audio shifted right)"
+                        f"— inserting at natural length"
                     )
                     splice_start = int(seg_start * sr)
                     gap_end = int(seg_end * sr)
                     tail = audio[gap_end:].copy()
-                    audio = np.concatenate([
-                        audio[:splice_start],
-                        tts_audio,
-                        tail,
-                    ])
+                    audio = np.concatenate([audio[:splice_start], tts_audio, tail])
                     restored_count += 1
-                    seg_id = seg['id']
                     log.info(
-                        f"  Spliced TTS for segment {seg_id} "
+                        f"  Spliced TTS for segment {seg.get('id','?')} "
                         f"({seg_start:.1f}s): \"{text[:50]}\""
                     )
-                    continue  # skip the normal splice below
+                    continue
 
-            # Apply fade-in/out to avoid clicks (10ms)
+            # Fade in/out to avoid clicks (10ms)
             fade_samples = min(int(0.010 * sr), len(tts_audio) // 4)
             if fade_samples > 0:
                 fade = np.linspace(0, 1, fade_samples)
                 tts_audio[:fade_samples] *= fade
                 tts_audio[-fade_samples:] *= fade[::-1]
 
-            # Normalize TTS volume to match surrounding audio level
+            # Match volume to surrounding audio
             start_sample = int(seg_start * sr)
             end_sample = min(int(seg_end * sr), len(audio))
             if end_sample > start_sample and end_sample <= len(audio):
@@ -696,7 +643,7 @@ def _restore_audio_tts(
                 if tts_rms > 1e-6 and source_rms > 1e-6:
                     tts_audio = tts_audio * (source_rms / tts_rms)
 
-            # Splice into audio
+            # Splice
             splice_start = int(seg_start * sr)
             splice_end = splice_start + len(tts_audio)
 
@@ -706,15 +653,16 @@ def _restore_audio_tts(
             audio[splice_start:splice_end] = tts_audio
             restored_count += 1
             log.info(
-                f"  Spliced TTS for segment {seg['id']} "
+                f"  Spliced TTS for segment {seg.get('id','?')} "
                 f"({seg_start:.1f}s-{seg_end:.1f}s): \"{text[:40]}\""
             )
 
     if restored_count == 0:
-        log.warning("No segments were spliced (TTS synthesis may have failed for all).")
+        log.warning("No segments spliced — copying source audio unchanged.")
+        import shutil
+        shutil.copy(source_audio_path, output_audio_path)
         return
 
-    # Save output
     audio_out = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio_out * 32767).astype(np.int16)
     wav_io.write(output_audio_path, sr, audio_int16)
@@ -724,28 +672,83 @@ def _restore_audio_tts(
 def _get_tts_function(language: str, log: logging.Logger):
     """Return a TTS function: tts_fn(text, output_wav_path)."""
 
-    # Try gTTS (Google TTS) — free, online, best quality
+    # edge-tts: Microsoft Neural TTS — best quality, free, needs internet
+    try:
+        import edge_tts
+        import asyncio
+        import subprocess
+
+        EDGE_VOICES = {
+            "ru": "ru-RU-SvetlanaNeural",
+            "en": "en-US-JennyNeural",
+            "de": "de-DE-KatjaNeural",
+            "fr": "fr-FR-DeniseNeural",
+            "uk": "uk-UA-PolinaNeural",
+        }
+        voice = EDGE_VOICES.get(language, "en-US-JennyNeural")
+
+        def edge_synthesize(text: str, output_wav: str):
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tmp_mp3 = f.name
+            try:
+                async def _run():
+                    communicate = edge_tts.Communicate(text, voice)
+                    await communicate.save(tmp_mp3)
+
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_run())
+                finally:
+                    loop.close()
+
+                # Convert MP3 -> WAV and trim leading silence
+                result = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", tmp_mp3,
+                        "-af", "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-50dB",
+                        "-ar", "16000", "-ac", "1",
+                        "-acodec", "pcm_s16le", output_wav,
+                    ],
+                    capture_output=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffmpeg failed: {result.stderr[-300:]}")
+            finally:
+                if os.path.exists(tmp_mp3):
+                    os.unlink(tmp_mp3)
+
+        log.info(f"TTS backend: edge-tts (Microsoft Neural, voice={voice})")
+        return edge_synthesize
+    except ImportError:
+        log.info("edge-tts not available, trying gTTS...")
+
+    # gTTS fallback
     try:
         from gtts import gTTS
         import subprocess
 
         def gtts_synthesize(text: str, output_wav: str):
-            import tempfile, os
-            # gTTS outputs MP3, convert to WAV via ffmpeg
+            import tempfile
+
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 tmp_mp3 = f.name
             try:
                 tts = gTTS(text=text, lang=language, slow=False)
                 tts.save(tmp_mp3)
-                # Convert MP3 → WAV
+                # Trim leading silence that causes the ~1s delay
                 result = subprocess.run(
-                    ["ffmpeg", "-y", "-i", tmp_mp3,
-                     "-ar", "16000", "-ac", "1",
-                     "-acodec", "pcm_s16le", output_wav],
+                    [
+                        "ffmpeg", "-y", "-i", tmp_mp3,
+                        "-af", "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-50dB",
+                        "-ar", "16000", "-ac", "1",
+                        "-acodec", "pcm_s16le", output_wav,
+                    ],
                     capture_output=True, timeout=30,
                 )
                 if result.returncode != 0:
-                    raise RuntimeError(f"ffmpeg MP3→WAV failed: {result.stderr[-300:]}")
+                    raise RuntimeError(f"ffmpeg MP3->WAV failed: {result.stderr[-300:]}")
             finally:
                 if os.path.exists(tmp_mp3):
                     os.unlink(tmp_mp3)
@@ -755,14 +758,11 @@ def _get_tts_function(language: str, log: logging.Logger):
     except ImportError:
         log.info("gTTS not available, trying pyttsx3...")
 
-    # Try pyttsx3 — offline, system voices
+    # pyttsx3 offline fallback
     try:
         import pyttsx3
-        import wave
-        import tempfile
 
         engine = pyttsx3.init()
-        # Try to set language voice
         voices = engine.getProperty("voices")
         for v in voices:
             if language.lower() in (v.languages or []) or language in v.id.lower():
@@ -777,12 +777,11 @@ def _get_tts_function(language: str, log: logging.Logger):
         log.info("TTS backend: pyttsx3 (offline)")
         return pyttsx3_synthesize
     except ImportError:
-        log.warning("No TTS backend found. Install: pip install gtts  or  pip install pyttsx3")
+        log.warning("No TTS backend found. Install: pip install edge-tts")
         return None
 
 
 def _resample(audio: "np.ndarray", from_sr: int, to_sr: int) -> "np.ndarray":
-    """Resample audio array from from_sr to to_sr."""
     import numpy as np
     if from_sr == to_sr:
         return audio
@@ -800,11 +799,6 @@ def _pitch_preserving_stretch(
         target_len: int,
         log: "logging.Logger",
 ) -> "Optional[np.ndarray]":
-    """
-    Stretch audio to target_len samples WITHOUT changing pitch.
-    Uses librosa phase vocoder (PSOLA-like). Returns None if unavailable.
-    Max compression ratio allowed: 0.5 (never more than 2x faster).
-    """
     import numpy as np
 
     if len(audio) == target_len:
@@ -812,7 +806,6 @@ def _pitch_preserving_stretch(
 
     rate = len(audio) / max(target_len, 1)
 
-    # Refuse extreme compression — would sound unnatural regardless
     if rate > 2.0:
         log.info(f"  Stretch ratio {rate:.2f} too extreme — skipping stretch")
         return None
@@ -820,7 +813,6 @@ def _pitch_preserving_stretch(
     try:
         import librosa
         stretched = librosa.effects.time_stretch(audio.astype(np.float32), rate=rate)
-        # Trim or pad to exact target length
         if len(stretched) > target_len:
             stretched = stretched[:target_len]
         elif len(stretched) < target_len:
@@ -834,9 +826,9 @@ def _pitch_preserving_stretch(
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Prompt builder
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _build_restoration_prompt(
         unclear_text: str,
@@ -880,7 +872,6 @@ def _get_context(
         window: int,
         before: bool,
 ) -> str:
-    """Get text context around a segment."""
     texts = []
 
     if before:
@@ -903,12 +894,11 @@ def _get_context(
     return " ".join(texts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Build full text
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _build_full_text(segments: List[dict]) -> str:
-    """Build full transcript text with timestamps header."""
     lines = []
     lines.append("TRANSCRIPT\n" + "=" * 60 + "\n")
 
@@ -942,9 +932,9 @@ def _build_full_text(segments: List[dict]) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # Text cleaning utilities
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 _NOISE_PATTERNS = [
     r"^\s*$",
