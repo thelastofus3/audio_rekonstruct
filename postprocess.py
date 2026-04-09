@@ -517,7 +517,7 @@ def _restore_audio_tts(
     _unclear_word_re2 = re.compile(r'\[([^\]]+)\?\]')
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for seg in segments:
+        for seg_index, seg in enumerate(segments):
             seg_text_raw = seg.get("text", "")
             restoration_tag = seg.get("restoration_tag", "")
 
@@ -549,7 +549,20 @@ def _restore_audio_tts(
                 )
                 continue
 
-            seg_start, seg_end = _estimate_tts_splice_bounds(seg, audio, sr, log)
+            prev_end = float(segments[seg_index - 1].get("end", 0.0)) if seg_index > 0 else 0.0
+            next_start = (
+                float(segments[seg_index + 1].get("start", len(audio) / sr))
+                if seg_index + 1 < len(segments)
+                else len(audio) / sr
+            )
+            seg_start, seg_end = _estimate_tts_splice_bounds(
+                seg,
+                audio,
+                sr,
+                log,
+                prev_end=prev_end,
+                next_start=next_start,
+            )
             seg_duration = seg_end - seg_start
             if seg_duration <= 0.05:
                 continue
@@ -772,34 +785,45 @@ def _estimate_tts_splice_bounds(
         audio: "np.ndarray",
         sr: int,
         log: "logging.Logger",
+        prev_end: Optional[float] = None,
+        next_start: Optional[float] = None,
 ) -> Tuple[float, float]:
     seg_start = float(seg.get("start", 0.0) or 0.0)
     seg_end = float(seg.get("end", 0.0) or 0.0)
     words = seg.get("words", []) or []
     was_llm_restored = str(seg.get("restoration_method", "")).startswith("llm_")
+    prev_end = seg_start if prev_end is None else float(prev_end)
+    next_start = seg_end if next_start is None else float(next_start)
 
     if seg_end <= seg_start:
         return seg_start, seg_end
 
     if was_llm_restored:
-        refined_start = _find_energy_boundary(
+        onset_search_start = max(0.0, prev_end)
+        onset_search_end = min(next_start, seg_start + 0.12)
+        offset_search_start = max(onset_search_start, min(seg_end - 0.08, prev_end))
+        offset_search_end = min(len(audio) / sr, max(seg_end, next_start))
+
+        onset = _find_speech_transition(
             audio=audio,
             sr=sr,
-            anchor_sec=seg_start,
-            search_start_sec=max(0.0, seg_start - 0.12),
-            search_end_sec=min(seg_end, seg_start + 0.18),
-            direction="backward",
+            search_start_sec=onset_search_start,
+            search_end_sec=onset_search_end,
+            transition="onset",
         )
-        refined_end = _find_energy_boundary(
+        offset = _find_speech_transition(
             audio=audio,
             sr=sr,
-            anchor_sec=seg_end,
-            search_start_sec=max(seg_start, seg_end - 0.18),
-            search_end_sec=min(len(audio) / sr, seg_end + 0.12),
-            direction="forward",
+            search_start_sec=offset_search_start,
+            search_end_sec=offset_search_end,
+            transition="offset",
         )
-        refined_start = min(refined_start, seg_start)
-        refined_end = max(refined_end, seg_end)
+        start_candidate = min(onset, seg_start)
+        # Blend between the earlier detected onset and the ASR start. This keeps
+        # the cut earlier than Whisper's late timestamp without jumping all the
+        # way to the first transient in the gap.
+        refined_start = max(prev_end, start_candidate + (seg_start - start_candidate) * 0.40)
+        refined_end = max(seg_end, offset + 0.02)
 
         log.info(
             f"  Segment {seg.get('id','?')}: full-segment replacement "
@@ -852,6 +876,60 @@ def _estimate_tts_splice_bounds(
         )
 
     return refined_start, refined_end
+
+
+def _find_speech_transition(
+        audio: "np.ndarray",
+        sr: int,
+        search_start_sec: float,
+        search_end_sec: float,
+        transition: str,
+) -> float:
+    import numpy as np
+
+    search_start_sec = max(0.0, search_start_sec)
+    search_end_sec = min(len(audio) / sr, search_end_sec)
+    if search_end_sec <= search_start_sec:
+        return search_start_sec
+
+    start_sample = int(search_start_sec * sr)
+    end_sample = int(search_end_sec * sr)
+    window = max(128, int(0.02 * sr))
+    hop = max(64, int(0.005 * sr))
+    if end_sample - start_sample < window:
+        return search_start_sec if transition == "onset" else search_end_sec
+
+    rms = []
+    centers = []
+    for pos in range(start_sample, end_sample - window + 1, hop):
+        frame = audio[pos:pos + window]
+        rms.append(float(np.sqrt(np.mean(frame ** 2) + 1e-12)))
+        centers.append((pos + window / 2) / sr)
+
+    if not rms:
+        return search_start_sec if transition == "onset" else search_end_sec
+
+    rms = np.asarray(rms, dtype=np.float32)
+    noise_floor = float(np.percentile(rms, 15))
+    speech_peak = float(np.percentile(rms, 95))
+    threshold = noise_floor + (speech_peak - noise_floor) * 0.18
+    min_run = 3
+
+    if transition == "onset":
+        run = 0
+        for idx, level in enumerate(rms):
+            run = run + 1 if level >= threshold else 0
+            if run >= min_run:
+                return centers[max(0, idx - min_run + 1)]
+        return search_start_sec
+
+    run = 0
+    for idx in range(len(rms) - 1, -1, -1):
+        level = rms[idx]
+        run = run + 1 if level >= threshold else 0
+        if run >= min_run:
+            return centers[min(len(centers) - 1, idx + min_run - 1)]
+    return search_end_sec
 
 
 def _find_energy_boundary(
@@ -937,22 +1015,30 @@ def _splice_with_crossfade(
         audio[splice_start:output_end] = insert_audio
         return audio
 
-    start_mix = audio[splice_start:splice_start + crossfade].copy()
-    end_mix = audio[max(splice_end - crossfade, splice_start):splice_end].copy()
+    left_ctx_start = max(0, splice_start - crossfade)
+    left_ctx = audio[left_ctx_start:splice_start].copy()
+    right_ctx_end = min(len(audio), splice_end + crossfade)
+    right_ctx = audio[splice_end:right_ctx_end].copy()
 
-    if len(start_mix) < crossfade:
-        start_mix = np.pad(start_mix, (0, crossfade - len(start_mix)))
-    if len(end_mix) < crossfade:
-        end_mix = np.pad(end_mix, (0, crossfade - len(end_mix)))
+    if len(left_ctx) < crossfade:
+        left_ctx = np.pad(left_ctx, (crossfade - len(left_ctx), 0))
+    if len(right_ctx) < crossfade:
+        right_ctx = np.pad(right_ctx, (0, crossfade - len(right_ctx)))
 
     fade_out = np.sqrt(np.linspace(1.0, 0.0, crossfade, dtype=np.float32))
     fade_in = np.sqrt(np.linspace(0.0, 1.0, crossfade, dtype=np.float32))
 
-    insert = insert_audio.copy()
-    insert[:crossfade] = insert[:crossfade] * fade_in + start_mix[:crossfade] * fade_out
-    insert[-crossfade:] = insert[-crossfade:] * fade_out + end_mix[:crossfade] * fade_in
+    head = left_ctx[:crossfade] * fade_out + insert_audio[:crossfade] * fade_in
+    tail = insert_audio[-crossfade:] * fade_out + right_ctx[:crossfade] * fade_in
+    middle = insert_audio[crossfade:-crossfade]
 
-    return np.concatenate([audio[:splice_start], insert, audio[splice_end:]])
+    return np.concatenate([
+        audio[:left_ctx_start],
+        head,
+        middle,
+        tail,
+        audio[right_ctx_end:],
+    ])
 
 
 def _pitch_preserving_stretch(
