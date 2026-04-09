@@ -111,8 +111,8 @@ Examples:
     )
     parser.add_argument(
         "--tts-language",
-        default="ru",
-        help="Language code for TTS synthesis when --restore-audio is used (default: ru)",
+        default=None,
+        help="Language code for TTS synthesis when --restore-audio is used (default: input language or en)",
     )
     parser.add_argument(
         "--confidence-threshold",
