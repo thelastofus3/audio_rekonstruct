@@ -211,6 +211,7 @@ def _mark_unclear_words(
                 new_words.append(w)
 
         if has_unclear_words:
+            seg["is_unclear"] = True
             text_parts = []
             for w in new_words:
                 word_text = w.get("word", "")
@@ -274,10 +275,19 @@ def _llm_restore(
             try:
                 restored = llm_fn(prompt)
                 if restored and len(restored) > 2:
-                    result[i] = dict(seg)
-                    result[i]["text"] = f"[предположение] {restored}"
-                    result[i]["restoration_method"] = f"llm_{provider}"
-                    log.debug(f"LLM restored segment {i}: '{restored[:50]}...'")
+                    slot_duration = seg.get("end", 0.0) - seg.get("start", 0.0)
+                    word_count = len(restored.split())
+                    # Reject if too few words for a long slot (< 1 word per 1.5s)
+                    if slot_duration > 2.0 and word_count < max(2, slot_duration / 1.5):
+                        log.info(
+                            f"LLM restored only {word_count} word(s) for "
+                            f"{slot_duration:.1f}s slot — keeping original unclear tag."
+                        )
+                    else:
+                        result[i] = dict(seg)
+                        result[i]["text"] = f"[предположение] {restored}"
+                        result[i]["restoration_method"] = f"llm_{provider}"
+                        log.debug(f"LLM restored segment {i}: '{restored[:50]}...'")
             except Exception as e:
                 log.warning(f"LLM restoration failed for segment {i}: {e}")
 
@@ -602,7 +612,17 @@ def _restore_audio_tts(
             # Fit TTS into the slot
             if ratio <= 1.25:
                 if tts_len < target_samples:
-                    tts_audio = np.pad(tts_audio, (0, target_samples - tts_len))
+                    # Fill remainder with original audio (not silence)
+                    orig_start_sample = int(seg_start * sr) + tts_len
+                    orig_end_sample = int(seg_end * sr)
+                    orig_end_sample = min(orig_end_sample, len(audio))
+                    orig_tail = audio[orig_start_sample:orig_end_sample].copy()
+                    pad_needed = target_samples - tts_len
+                    if len(orig_tail) >= pad_needed:
+                        orig_tail = orig_tail[:pad_needed]
+                    else:
+                        orig_tail = np.pad(orig_tail, (0, pad_needed - len(orig_tail)))
+                    tts_audio = np.concatenate([tts_audio, orig_tail])
                 else:
                     tts_audio = tts_audio[:target_samples]
             else:

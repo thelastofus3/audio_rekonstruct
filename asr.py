@@ -117,9 +117,11 @@ def _asr_faster_whisper(
     log.info("Transcribing...")
     start = time.time()
 
+    use_builtin_vad = _should_use_builtin_vad(audio_path, vad_segments, log)
+
     transcribe_kwargs = {
         "word_timestamps": True,
-        "vad_filter": vad_segments is None,  # use built-in VAD if no external VAD
+        "vad_filter": use_builtin_vad,
         "vad_parameters": {"min_silence_duration_ms": 500},
         "beam_size": 5,
         "best_of": 5,
@@ -346,6 +348,39 @@ def _segment_in_vad(
 
         if overlap / seg_duration >= overlap_threshold:
             return True
+
+    return False
+
+
+def _should_use_builtin_vad(
+    audio_path: str,
+    vad_segments: Optional[List[dict]],
+    log: logging.Logger,
+) -> bool:
+    """Prefer Whisper VAD when external VAD is missing or too coarse."""
+    if not vad_segments:
+        return True
+
+    try:
+        import scipy.io.wavfile as wav_io
+
+        sr, data = wav_io.read(audio_path)
+        audio_duration = len(data) / max(sr, 1)
+    except Exception:
+        audio_duration = None
+
+    total_vad = sum(
+        max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)))
+        for seg in vad_segments
+    )
+
+    if len(vad_segments) <= 1:
+        log.info("External VAD is too coarse; keeping faster-whisper built-in VAD enabled.")
+        return True
+
+    if audio_duration and total_vad >= audio_duration * 0.9:
+        log.info("External VAD covers nearly full audio; keeping faster-whisper built-in VAD enabled.")
+        return True
 
     return False
 
