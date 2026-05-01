@@ -122,15 +122,17 @@ def _asr_faster_whisper(
     transcribe_kwargs = {
         "word_timestamps": True,
         "vad_filter": use_builtin_vad,
-        "vad_parameters": {"min_silence_duration_ms": 500},
+        "vad_parameters": {"min_silence_duration_ms": 300},  # More sensitive to pauses
         "beam_size": 5,
         "best_of": 5,
         "temperature": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.6,
+        "no_speech_threshold": 0.5,  # Lower threshold = less likely to mark as no-speech
         "condition_on_previous_text": True,
         "initial_prompt": _get_initial_prompt(language),
+        "repetition_penalty": 1.0,  # Prevent repetitions
+        "no_repeat_ngram_size": 0,
     }
 
     if language:
@@ -144,6 +146,10 @@ def _asr_faster_whisper(
         f"Detected language: {detected_lang} (confidence={lang_prob:.2f})"
         + (f", forced={language}" if language else "")
     )
+
+    if vad_segments:
+        log.info(f"Using external VAD: {len(vad_segments)} segments provided")
+    log.info(f"Whisper VAD filter: {'enabled' if use_builtin_vad else 'disabled'}")
 
     # Collect segments
     result_segments = []
@@ -387,11 +393,6 @@ def _should_use_builtin_vad(
 
 def _get_initial_prompt(language: Optional[str]) -> Optional[str]:
     """Get language-specific initial prompt for better accuracy."""
-    prompts = {
-        "ru": "Транскрипция аудио записи. Речь содержит технические термины.",
-        "en": "Transcription of an audio recording.",
-        "de": "Transkription einer Audioaufnahme.",
-        "fr": "Transcription d'un enregistrement audio.",
-        "uk": "Транскрипція аудіозапису.",
-    }
-    return prompts.get(language, None)
+    # Removed prompts to avoid Whisper hallucinations
+    # Initial prompts can cause Whisper to return the prompt text instead of actual transcription
+    return None

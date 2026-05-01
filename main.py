@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -157,6 +158,46 @@ def save_results(
 
     return txt_path, json_path
 
+def mux_video_with_audio(
+        video_path: Path,
+        audio_path: Path,
+        output_video_path: Path,
+        logger: logging.Logger,
+) -> Path:
+    """Combine original video with processed audio."""
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        str(output_video_path),
+    ]
+    logger.info(f"Muxing processed audio back into video: {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        logger.error(f"ffmpeg stderr:\n{result.stderr[-2000:]}")
+        raise RuntimeError(
+            f"ffmpeg video mux failed with code {result.returncode}.\n"
+            f"stderr: {result.stderr[-500:]}"
+        )
+    if not output_video_path.exists() or output_video_path.stat().st_size == 0:
+        raise RuntimeError(f"Output video is empty or missing: {output_video_path}")
+    logger.info(f"Output video saved: {output_video_path}")
+    return output_video_path
+
 
 def main():
     print("\n" + "=" * 60)
@@ -191,7 +232,7 @@ def main():
 
     total_start = time.time()
 
-    # ─── STEP 1: Extract audio ───────────────────────────────────────────────
+    # STEP 1: Extract audio
     logger.info("\n[STEP 1/5] Extracting audio from video...")
     raw_audio_path = output_dir / "audio_raw.wav"
     try:
@@ -201,7 +242,7 @@ def main():
         logger.error(f"Audio extraction failed: {e}")
         sys.exit(1)
 
-    # ─── STEP 2: Enhance audio ───────────────────────────────────────────────
+    # STEP 2: Enhance audio
     if not args.no_enhance:
         logger.info("\n[STEP 2/5] Enhancing audio (denoising, dereverberation)...")
         enhanced_audio_path = output_dir / "audio_enhanced.wav"
@@ -224,7 +265,7 @@ def main():
         import shutil
         shutil.copy(str(raw_audio_path), str(output_dir / "audio_enhanced.wav"))
 
-    # ─── STEP 3: VAD ─────────────────────────────────────────────────────────
+    # STEP 3: VAD
     if not args.no_vad:
         logger.info("\n[STEP 3/5] Running Voice Activity Detection...")
         try:
@@ -237,7 +278,7 @@ def main():
         logger.info("\n[STEP 3/5] Skipping VAD (--no-vad).")
         vad_segments = None
 
-    # ─── STEP 4: ASR ─────────────────────────────────────────────────────────
+    # STEP 4: ASR
     logger.info("\n[STEP 4/5] Running ASR (Speech Recognition)...")
     try:
         language = None if args.language == "auto" else args.language
@@ -255,7 +296,7 @@ def main():
         logger.error(f"ASR failed: {e}")
         sys.exit(1)
 
-    # ─── STEP 5: Postprocessing ───────────────────────────────────────────────
+    # STEP 5: Postprocessing
     logger.info("\n[STEP 5/5] Postprocessing transcript...")
     try:
         restored_audio_path = str(output_dir / "audio_restored.wav")
@@ -279,7 +320,18 @@ def main():
         final_segments = asr_segments
         full_text = " ".join(s.get("text", "") for s in asr_segments)
 
-    # ─── Save results ──────────────────────────────────────────────────────────
+    # Save results
+    final_audio_path = output_dir / "audio_enhanced.wav"
+    if args.llm_postprocess or getattr(args, "restore_audio", False):
+        restored_candidate = output_dir / "audio_restored.wav"
+        if restored_candidate.exists() and restored_candidate.stat().st_size > 0:
+            final_audio_path = restored_candidate
+    output_video_path = output_dir / f"{input_path.stem}_fixed{input_path.suffix}"
+    try:
+        mux_video_with_audio(input_path, final_audio_path, output_video_path, logger)
+    except Exception as e:
+        logger.warning(f"Video mux failed: {e}")
+        output_video_path = None
     txt_path, json_path = save_results(output_dir, final_segments, full_text, logger)
 
     total_elapsed = time.time() - total_start
@@ -290,6 +342,8 @@ def main():
     print(f"  Time elapsed   : {total_elapsed:.1f}s")
     print(f"  Segments found : {len(final_segments)}")
     print(f"  Output folder  : {output_dir.resolve()}")
+    if output_video_path:
+        print(f"  Output video   : {output_video_path}")
     print(f"  Enhanced audio : {output_dir / 'audio_enhanced.wav'}")
     if args.llm_postprocess or getattr(args, 'restore_audio', False):
         print(f"  Restored audio : {output_dir / 'audio_restored.wav'}")

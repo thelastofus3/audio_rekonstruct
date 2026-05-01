@@ -612,17 +612,10 @@ def _restore_audio_tts(
             # Fit TTS into the slot
             if ratio <= 1.25:
                 if tts_len < target_samples:
-                    # Fill remainder with original audio (not silence)
-                    orig_start_sample = int(seg_start * sr) + tts_len
-                    orig_end_sample = int(seg_end * sr)
-                    orig_end_sample = min(orig_end_sample, len(audio))
-                    orig_tail = audio[orig_start_sample:orig_end_sample].copy()
+                    # Pad with silence for inaudible segments to avoid bleed-through
                     pad_needed = target_samples - tts_len
-                    if len(orig_tail) >= pad_needed:
-                        orig_tail = orig_tail[:pad_needed]
-                    else:
-                        orig_tail = np.pad(orig_tail, (0, pad_needed - len(orig_tail)))
-                    tts_audio = np.concatenate([tts_audio, orig_tail])
+                    silence = np.zeros(pad_needed, dtype=tts_audio.dtype)
+                    tts_audio = np.concatenate([tts_audio, silence])
                 else:
                     tts_audio = tts_audio[:target_samples]
             else:
