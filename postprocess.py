@@ -680,12 +680,12 @@ def _get_tts_function(language: str, log: logging.Logger):
 
         EDGE_VOICES = {
             "ru": "ru-RU-SvetlanaNeural",
-            "en": "en-US-JennyNeural",
+            "en": "en-US-AndrewNeural",
             "de": "de-DE-KatjaNeural",
             "fr": "fr-FR-DeniseNeural",
             "uk": "uk-UA-PolinaNeural",
         }
-        voice = EDGE_VOICES.get(language, "en-US-JennyNeural")
+        voice = EDGE_VOICES.get(language, "en-US-AndrewNeural")
 
         def edge_synthesize(text: str, output_wav: str):
             import tempfile
