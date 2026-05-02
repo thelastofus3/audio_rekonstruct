@@ -3,10 +3,8 @@
 Audio enhancement: noise reduction, dereverberation, speech enhancement.
 
 Strategy (fallback chain):
-  1. Try facebook/denoiser (DNS48 model) - best quality
-  2. Try SpeechBrain MetricGAN+ - strong enhancement
-  3. Try noisereduce + spectral cleanup - lightweight
-  4. Last resort: basic bandpass filter only
+  1. Try noisereduce + spectral cleanup - lightweight
+  2. Last resort: basic bandpass filter only
 """
 
 import logging
@@ -43,8 +41,6 @@ def enhance_audio(
     log.info("Attempting enhancement methods...")
 
     methods = [
-        ("facebook/denoiser", _enhance_denoiser),
-        ("SpeechBrain MetricGAN+", _enhance_speechbrain),
         ("noisereduce", _enhance_noisereduce),
         ("scipy spectral subtraction", _enhance_scipy),
     ]
@@ -64,75 +60,6 @@ def enhance_audio(
     log.warning("All enhancement methods failed. Applying normalization only.")
     _normalize_only(str(input_path), str(output_path), log)
     return str(output_path)
-
-
-def _enhance_denoiser(input_wav: str, output_wav: str, log: logging.Logger):
-    """Use facebook/denoiser DNS48 model."""
-    import torch
-    import torchaudio
-    from denoiser import pretrained
-    from denoiser.dsp import convert_audio
-
-    log.info("Loading denoiser DNS48 model...")
-    start = time.time()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = pretrained.dns64() if _check_dns64() else pretrained.dns48()
-    model.to(device).eval()
-
-    wav, sr = torchaudio.load(input_wav)
-    wav = convert_audio(wav, sr, model.sample_rate, model.chin)
-    wav = wav.to(device)
-
-    log.info(f"Running denoiser (device={device})...")
-    with torch.no_grad():
-        enhanced = model(wav[None])[0]
-
-    enhanced = enhanced.cpu()
-    if enhanced.dim() == 1:
-        enhanced = enhanced.unsqueeze(0)
-
-    if model.sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(model.sample_rate, 16000)
-        enhanced = resampler(enhanced)
-
-    peak = enhanced.abs().max()
-    if peak > 0:
-        enhanced = enhanced / peak * 0.95
-
-    torchaudio.save(output_wav, enhanced, 16000)
-    log.info(f"Denoiser done in {time.time()-start:.1f}s")
-
-
-def _check_dns64():
-    """Check if dns64 is available (requires more memory)."""
-    try:
-        from denoiser import pretrained
-        return hasattr(pretrained, "dns64")
-    except Exception:
-        return False
-
-
-def _enhance_speechbrain(input_wav: str, output_wav: str, log: logging.Logger):
-    """Use SpeechBrain MetricGAN+ enhancement."""
-    import torch
-    from speechbrain.inference.enhancement import SpectralMaskEnhancement
-
-    log.info("Loading SpeechBrain MetricGAN+ model...")
-    start = time.time()
-
-    cache_dir = Path.home() / ".cache" / "speechbrain"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    model = SpectralMaskEnhancement.from_hparams(
-        source="speechbrain/metricgan-plus-voicebank",
-        savedir=str(cache_dir / "metricgan-plus"),
-        run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
-    )
-
-    log.info("Enhancing with MetricGAN+...")
-    model.enhance_file(input_wav, output_wav)
-    log.info(f"SpeechBrain done in {time.time()-start:.1f}s")
 
 
 def _enhance_noisereduce(input_wav: str, output_wav: str, log: logging.Logger):

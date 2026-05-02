@@ -113,25 +113,24 @@ def _asr_faster_whisper(
     )
     log.info(f"Model loaded in {time.time()-start:.1f}s")
 
-    # Transcribe
     log.info("Transcribing...")
     start = time.time()
 
-    use_builtin_vad = _should_use_builtin_vad(audio_path, vad_segments, log)
+    use_builtin_vad = not vad_segments or len(vad_segments) <= 1
 
     transcribe_kwargs = {
         "word_timestamps": True,
         "vad_filter": use_builtin_vad,
-        "vad_parameters": {"min_silence_duration_ms": 300},  # More sensitive to pauses
+        "vad_parameters": {"min_silence_duration_ms": 300},
         "beam_size": 5,
         "best_of": 5,
         "temperature": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.5,  # Lower threshold = less likely to mark as no-speech
+        "no_speech_threshold": 0.5,
         "condition_on_previous_text": True,
-        "initial_prompt": _get_initial_prompt(language),
-        "repetition_penalty": 1.0,  # Prevent repetitions
+        "initial_prompt": None,
+        "repetition_penalty": 1.0,
         "no_repeat_ngram_size": 0,
     }
 
@@ -156,22 +155,17 @@ def _asr_faster_whisper(
     segment_id = 0
 
     for seg in segments_gen:
-        # Compute confidence from avg_logprob
-        # avg_logprob is typically in [-2.0, 0.0], map to [0, 1]
         log_prob = seg.avg_logprob if hasattr(seg, "avg_logprob") else -0.5
         confidence = _logprob_to_confidence(log_prob)
 
-        # No-speech probability
         no_speech_prob = seg.no_speech_prob if hasattr(seg, "no_speech_prob") else 0.0
 
-        # Determine if unclear
         is_unclear = (
             confidence < confidence_threshold
             or no_speech_prob > 0.7
             or len(seg.text.strip()) == 0
         )
 
-        # Extract word-level timestamps
         words = []
         if hasattr(seg, "words") and seg.words:
             for w in seg.words:
@@ -188,7 +182,6 @@ def _asr_faster_whisper(
 
         text = seg.text.strip()
 
-        # Apply VAD filter: skip segments outside VAD windows
         if vad_segments and not _segment_in_vad(seg.start, seg.end, vad_segments):
             log.debug(f"Skipping ASR segment outside VAD: {seg.start:.1f}-{seg.end:.1f}s")
             continue
@@ -206,7 +199,6 @@ def _asr_faster_whisper(
         })
         segment_id += 1
 
-        # Progress log
         if segment_id % 20 == 0:
             log.info(f"  Transcribed {segment_id} segments... ({seg.end:.0f}s)")
 
@@ -228,8 +220,6 @@ def _asr_openai_whisper(
     log: logging.Logger,
 ) -> List[dict]:
     import whisper
-    import torch
-    import numpy as np
 
     log.info(f"Loading openai-whisper model '{model_name}'...")
     start = time.time()
@@ -254,7 +244,7 @@ def _asr_openai_whisper(
         "logprob_threshold": -1.0,
         "no_speech_threshold": 0.6,
         "condition_on_previous_text": True,
-        "initial_prompt": _get_initial_prompt(language),
+        "initial_prompt": None,
     }
 
     if language:
@@ -277,7 +267,6 @@ def _asr_openai_whisper(
             or len(seg.get("text", "").strip()) == 0
         )
 
-        # Word timestamps
         words = []
         for w in seg.get("words", []):
             word_prob = w.get("probability", 0.5)
@@ -330,8 +319,6 @@ def _logprob_to_confidence(
         return 0.5
 
     lp = float(log_prob)
-    # avg_logprob typically in [-2.0, 0.0]
-    # Map: 0.0 -> 1.0,  -1.0 -> 0.37,  -2.0 -> 0.14
     confidence = math.exp(max(lp, -5.0))
     return round(max(0.0, min(1.0, confidence)), 4)
 
@@ -356,43 +343,3 @@ def _segment_in_vad(
             return True
 
     return False
-
-
-def _should_use_builtin_vad(
-    audio_path: str,
-    vad_segments: Optional[List[dict]],
-    log: logging.Logger,
-) -> bool:
-    """Prefer Whisper VAD when external VAD is missing or too coarse."""
-    if not vad_segments:
-        return True
-
-    try:
-        import scipy.io.wavfile as wav_io
-
-        sr, data = wav_io.read(audio_path)
-        audio_duration = len(data) / max(sr, 1)
-    except Exception:
-        audio_duration = None
-
-    total_vad = sum(
-        max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)))
-        for seg in vad_segments
-    )
-
-    if len(vad_segments) <= 1:
-        log.info("External VAD is too coarse; keeping faster-whisper built-in VAD enabled.")
-        return True
-
-    if audio_duration and total_vad >= audio_duration * 0.9:
-        log.info("External VAD covers nearly full audio; keeping faster-whisper built-in VAD enabled.")
-        return True
-
-    return False
-
-
-def _get_initial_prompt(language: Optional[str]) -> Optional[str]:
-    """Get language-specific initial prompt for better accuracy."""
-    # Removed prompts to avoid Whisper hallucinations
-    # Initial prompts can cause Whisper to return the prompt text instead of actual transcription
-    return None

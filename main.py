@@ -108,7 +108,7 @@ Examples:
     parser.add_argument(
         "--restore-audio",
         action="store_true",
-        help="Synthesize restored text via TTS and splice back into audio (requires gtts or pyttsx3)",
+        help="Synthesize restored text via TTS and splice back into audio (requires edge-tts or gtts)",
     )
     parser.add_argument(
         "--tts-language",
@@ -138,13 +138,11 @@ def save_results(
 ):
     """Save transcript.txt and transcript.json."""
 
-    # Save plain text
     txt_path = output_dir / "transcript.txt"
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(full_text)
     logger.info(f"Transcript saved: {txt_path}")
 
-    # Save JSON with timestamps and confidence
     json_path = output_dir / "transcript.json"
     output_data = {
         "created_at": datetime.now().isoformat(),
@@ -157,6 +155,7 @@ def save_results(
     logger.info(f"JSON transcript saved: {json_path}")
 
     return txt_path, json_path
+
 
 def mux_video_with_audio(
         video_path: Path,
@@ -209,7 +208,6 @@ def main():
 
     args = parse_args()
 
-    # Validate input
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"[ERROR] Input file not found: {input_path}")
@@ -219,7 +217,6 @@ def main():
     if input_path.suffix.lower() not in supported_ext:
         print(f"[WARNING] Unsupported extension '{input_path.suffix}'. Proceeding anyway.")
 
-    # Setup output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -300,9 +297,8 @@ def main():
     logger.info("\n[STEP 5/5] Postprocessing transcript...")
     try:
         restored_audio_path = str(output_dir / "audio_restored.wav")
-        # restore_audio is auto-enabled when llm_postprocess is used
-        do_restore_audio = args.llm_postprocess or getattr(args, "restore_audio", False)
-        tts_lang = getattr(args, "tts_language", None) or (args.language if args.language != "auto" else "en")
+        do_restore_audio = args.llm_postprocess or args.restore_audio
+        tts_lang = args.tts_language or (args.language if args.language != "auto" else "en")
         final_segments, full_text = postprocess_transcript(
             segments=asr_segments,
             use_llm=args.llm_postprocess,
@@ -322,16 +318,18 @@ def main():
 
     # Save results
     final_audio_path = output_dir / "audio_enhanced.wav"
-    if args.llm_postprocess or getattr(args, "restore_audio", False):
+    if args.llm_postprocess or args.restore_audio:
         restored_candidate = output_dir / "audio_restored.wav"
         if restored_candidate.exists() and restored_candidate.stat().st_size > 0:
             final_audio_path = restored_candidate
+
     output_video_path = output_dir / f"{input_path.stem}_fixed{input_path.suffix}"
     try:
         mux_video_with_audio(input_path, final_audio_path, output_video_path, logger)
     except Exception as e:
         logger.warning(f"Video mux failed: {e}")
         output_video_path = None
+
     txt_path, json_path = save_results(output_dir, final_segments, full_text, logger)
 
     total_elapsed = time.time() - total_start
@@ -345,7 +343,7 @@ def main():
     if output_video_path:
         print(f"  Output video   : {output_video_path}")
     print(f"  Enhanced audio : {output_dir / 'audio_enhanced.wav'}")
-    if args.llm_postprocess or getattr(args, 'restore_audio', False):
+    if args.llm_postprocess or args.restore_audio:
         print(f"  Restored audio : {output_dir / 'audio_restored.wav'}")
     print(f"  Transcript TXT : {txt_path}")
     print(f"  Transcript JSON: {json_path}")
