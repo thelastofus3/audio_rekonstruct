@@ -1,7 +1,7 @@
 """
 # file: postprocess.py
 Transcript postprocessing:
-  - Mark unclear/inaudible segments with [неразборчиво], [предположение], [вариант1/вариант2]
+  - Mark unclear/inaudible segments with [inaudible], [assumption], [вариант1/вариант2]
   - LLM restoration of unclear text via internal Claude API (no external API key package needed)
   - Optional TTS audio restoration: synthesize restored text and splice back into audio
   - Build clean full-text transcript
@@ -21,8 +21,8 @@ import time
 from typing import List, Optional, Tuple
 
 
-INAUDIBLE_TAG = "[неразборчиво]"
-ASSUMPTION_TAG = "[предположение]"
+INAUDIBLE_TAG = "[inaudible]"
+ASSUMPTION_TAG = "[assumption]"
 
 
 def postprocess_transcript(
@@ -84,7 +84,7 @@ def postprocess_transcript(
             log.info("No unclear segments for LLM restoration.")
 
     # Step 4: TTS audio restoration
-    # Only for fully inaudible segments ([неразборчиво]), NOT for [предположение]
+    # Only for fully inaudible segments ([inaudible]), NOT for [assumption]
     if restore_audio and audio_path and output_audio_path:
         tts_candidates = [
             s for s in processed
@@ -285,7 +285,7 @@ def _llm_restore(
                         )
                     else:
                         result[i] = dict(seg)
-                        result[i]["text"] = f"[предположение] {restored}"
+                        result[i]["text"] = f"[assumption] {restored}"
                         result[i]["restoration_method"] = f"llm_{provider}"
                         log.debug(f"LLM restored segment {i}: '{restored[:50]}...'")
             except Exception as e:
@@ -308,7 +308,7 @@ def _llm_restore(
                 restored = llm_fn(prompt)
                 if restored and len(restored) > 2:
                     result[i] = dict(seg)
-                    result[i]["text"] = f"[предположение] {restored}"
+                    result[i]["text"] = f"[assumption] {restored}"
                     result[i]["restoration_method"] = f"llm_{provider}"
                     log.debug(f"LLM clarified segment {i}: '{restored[:50]}...'")
             except Exception as e:
@@ -1110,11 +1110,11 @@ def _build_restoration_prompt(
             f"Context before: \"{context_before}\"\n"
             f"Context after: \"{context_after}\"\n\n"
             f"Based on this context, what short phrase (1-10 words) was most likely said in the missing segment?\n"
-            f"Respond ONLY with the most probable text. If impossible to determine, respond with exactly: [неразборчиво]"
+            f"Respond ONLY with the most probable text. If impossible to determine, respond with exactly: [inaudible]"
         )
     else:
         return (
-            f"Audio transcription contains unclear speech marked with [?] or [предположение].\n"
+            f"Audio transcription contains unclear speech marked with [?] or [assumption].\n"
             f"Language: {lang_name}\n\n"
             f"Context before: \"{context_before}\"\n"
             f"Unclear text: \"{unclear_text}\"\n"
@@ -1123,7 +1123,7 @@ def _build_restoration_prompt(
             f"- Return ONLY corrected text, no explanation\n"
             f"- Keep close to original if reasonable\n"
             f"- If multiple options exist, use format: [вариант1/вариант2]\n"
-            f"- If truly impossible, return: [неразборчиво]"
+            f"- If truly impossible, return: [inaudible]"
         )
 
 
