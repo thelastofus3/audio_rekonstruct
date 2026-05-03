@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -107,12 +108,12 @@ Examples:
     parser.add_argument(
         "--restore-audio",
         action="store_true",
-        help="Synthesize restored text via TTS and splice back into audio (requires gtts or pyttsx3)",
+        help="Synthesize restored text via TTS and splice back into audio (requires edge-tts or gtts)",
     )
     parser.add_argument(
         "--tts-language",
-        default="ru",
-        help="Language code for TTS synthesis when --restore-audio is used (default: ru)",
+        default=None,
+        help="Language code for TTS synthesis when --restore-audio is used (default: input language or en)",
     )
     parser.add_argument(
         "--confidence-threshold",
@@ -137,13 +138,11 @@ def save_results(
 ):
     """Save transcript.txt and transcript.json."""
 
-    # Save plain text
     txt_path = output_dir / "transcript.txt"
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(full_text)
     logger.info(f"Transcript saved: {txt_path}")
 
-    # Save JSON with timestamps and confidence
     json_path = output_dir / "transcript.json"
     output_data = {
         "created_at": datetime.now().isoformat(),
@@ -158,6 +157,47 @@ def save_results(
     return txt_path, json_path
 
 
+def mux_video_with_audio(
+        video_path: Path,
+        audio_path: Path,
+        output_video_path: Path,
+        logger: logging.Logger,
+) -> Path:
+    """Combine original video with processed audio."""
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        str(output_video_path),
+    ]
+    logger.info(f"Muxing processed audio back into video: {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        logger.error(f"ffmpeg stderr:\n{result.stderr[-2000:]}")
+        raise RuntimeError(
+            f"ffmpeg video mux failed with code {result.returncode}.\n"
+            f"stderr: {result.stderr[-500:]}"
+        )
+    if not output_video_path.exists() or output_video_path.stat().st_size == 0:
+        raise RuntimeError(f"Output video is empty or missing: {output_video_path}")
+    logger.info(f"Output video saved: {output_video_path}")
+    return output_video_path
+
+
 def main():
     print("\n" + "=" * 60)
     print("  SPEECH RESTORATION PIPELINE")
@@ -168,7 +208,6 @@ def main():
 
     args = parse_args()
 
-    # Validate input
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"[ERROR] Input file not found: {input_path}")
@@ -178,7 +217,6 @@ def main():
     if input_path.suffix.lower() not in supported_ext:
         print(f"[WARNING] Unsupported extension '{input_path.suffix}'. Proceeding anyway.")
 
-    # Setup output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -191,7 +229,7 @@ def main():
 
     total_start = time.time()
 
-    # ─── STEP 1: Extract audio ───────────────────────────────────────────────
+    # STEP 1: Extract audio
     logger.info("\n[STEP 1/5] Extracting audio from video...")
     raw_audio_path = output_dir / "audio_raw.wav"
     try:
@@ -201,7 +239,7 @@ def main():
         logger.error(f"Audio extraction failed: {e}")
         sys.exit(1)
 
-    # ─── STEP 2: Enhance audio ───────────────────────────────────────────────
+    # STEP 2: Enhance audio
     if not args.no_enhance:
         logger.info("\n[STEP 2/5] Enhancing audio (denoising, dereverberation)...")
         enhanced_audio_path = output_dir / "audio_enhanced.wav"
@@ -224,7 +262,7 @@ def main():
         import shutil
         shutil.copy(str(raw_audio_path), str(output_dir / "audio_enhanced.wav"))
 
-    # ─── STEP 3: VAD ─────────────────────────────────────────────────────────
+    # STEP 3: VAD
     if not args.no_vad:
         logger.info("\n[STEP 3/5] Running Voice Activity Detection...")
         try:
@@ -237,7 +275,7 @@ def main():
         logger.info("\n[STEP 3/5] Skipping VAD (--no-vad).")
         vad_segments = None
 
-    # ─── STEP 4: ASR ─────────────────────────────────────────────────────────
+    # STEP 4: ASR
     logger.info("\n[STEP 4/5] Running ASR (Speech Recognition)...")
     try:
         language = None if args.language == "auto" else args.language
@@ -255,13 +293,12 @@ def main():
         logger.error(f"ASR failed: {e}")
         sys.exit(1)
 
-    # ─── STEP 5: Postprocessing ───────────────────────────────────────────────
+    # STEP 5: Postprocessing
     logger.info("\n[STEP 5/5] Postprocessing transcript...")
     try:
         restored_audio_path = str(output_dir / "audio_restored.wav")
-        # restore_audio is auto-enabled when llm_postprocess is used
-        do_restore_audio = args.llm_postprocess or getattr(args, "restore_audio", False)
-        tts_lang = getattr(args, "tts_language", None) or (args.language if args.language != "auto" else "en")
+        do_restore_audio = args.llm_postprocess or args.restore_audio
+        tts_lang = args.tts_language or (args.language if args.language != "auto" else "en")
         final_segments, full_text = postprocess_transcript(
             segments=asr_segments,
             use_llm=args.llm_postprocess,
@@ -279,7 +316,20 @@ def main():
         final_segments = asr_segments
         full_text = " ".join(s.get("text", "") for s in asr_segments)
 
-    # ─── Save results ──────────────────────────────────────────────────────────
+    # Save results
+    final_audio_path = output_dir / "audio_enhanced.wav"
+    if args.llm_postprocess or args.restore_audio:
+        restored_candidate = output_dir / "audio_restored.wav"
+        if restored_candidate.exists() and restored_candidate.stat().st_size > 0:
+            final_audio_path = restored_candidate
+
+    output_video_path = output_dir / f"{input_path.stem}_fixed{input_path.suffix}"
+    try:
+        mux_video_with_audio(input_path, final_audio_path, output_video_path, logger)
+    except Exception as e:
+        logger.warning(f"Video mux failed: {e}")
+        output_video_path = None
+
     txt_path, json_path = save_results(output_dir, final_segments, full_text, logger)
 
     total_elapsed = time.time() - total_start
@@ -290,8 +340,10 @@ def main():
     print(f"  Time elapsed   : {total_elapsed:.1f}s")
     print(f"  Segments found : {len(final_segments)}")
     print(f"  Output folder  : {output_dir.resolve()}")
+    if output_video_path:
+        print(f"  Output video   : {output_video_path}")
     print(f"  Enhanced audio : {output_dir / 'audio_enhanced.wav'}")
-    if args.llm_postprocess or getattr(args, 'restore_audio', False):
+    if args.llm_postprocess or args.restore_audio:
         print(f"  Restored audio : {output_dir / 'audio_restored.wav'}")
     print(f"  Transcript TXT : {txt_path}")
     print(f"  Transcript JSON: {json_path}")
