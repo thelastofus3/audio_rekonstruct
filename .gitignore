@@ -1,0 +1,43 @@
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# IDE (PyCharm / IntelliJ)
+.idea/
+*.iml
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Логи
+*.log
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Результаты и временные файлы
+results/
+
+# Аудио/временные файлы (если генерируются)
+*.wav
+*.mp3
+*.flac
+*.tmp
+
+# Jupyter (если вдруг используешь)
+.ipynb_checkpoints/
+
+# Переменные окружения
+.env
+
+# Сборки / артефакты
+dist/
+build/
+*.egg-info/
+
+# Кэш инструментов
+.cache/

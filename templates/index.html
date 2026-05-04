@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VOICEFORGE — Speech Restoration</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">⬡ VoiceForge Studio</div>
+    <h1>Speech<br/><span>Restoration</span></h1>
+    <p class="subtitle">// AI-powered audio enhancement + transcription pipeline</p>
+  </header>
+
+  <!-- Drop zone -->
+  <div class="dropzone" id="dropzone">
+    <input type="file" id="fileInput" accept=".mp4,.mkv,.avi,.mov,.webm,.flv,.wmv"/>
+    <span class="drop-icon">▶</span>
+    <div class="drop-title">Drop your video here</div>
+    <div class="drop-sub">MP4 · MKV · AVI · MOV · WEBM · FLV · WMV</div>
+  </div>
+
+  <!-- File chosen card (replaces dropzone) -->
+  <div class="file-chosen" id="fileChosen">
+    <span class="file-chosen-name" id="fileChosenName"></span>
+    <span class="file-remove" id="fileRemove" onclick="removeFile()" title="Remove file">✕</span>
+  </div>
+
+  <!-- Options -->
+  <div class="options">
+    <div class="opt-group">
+      <span class="opt-label">Language</span>
+      <select id="optLang">
+        <option value="auto">Auto detect</option>
+        <option value="en" selected>English</option>
+        <option value="ru">Russian</option>
+        <option value="de">German</option>
+        <option value="fr">French</option>
+        <option value="uk">Ukrainian</option>
+      </select>
+    </div>
+
+    <div class="opt-group">
+      <span class="opt-label">Whisper Model</span>
+      <select id="optModel">
+        <option value="tiny">tiny — fastest</option>
+        <option value="base">base</option>
+        <option value="small">small</option>
+        <option value="medium" selected>medium — recommended</option>
+        <option value="large-v2">large-v2</option>
+        <option value="large-v3">large-v3 — best</option>
+      </select>
+    </div>
+
+    <div class="opt-group">
+      <span class="opt-label">LLM Provider</span>
+      <select id="optLLM">
+        <option value="local" selected>Local (Ollama)</option>
+        <option value="claude">Claude (Anthropic)</option>
+        <option value="openai">OpenAI GPT</option>
+      </select>
+    </div>
+
+    <div class="opt-group">
+      <span class="opt-label">Options</span>
+      <div class="toggle-wrap">
+        <button class="toggle-btn active" id="togLLM"       onclick="toggle(this)">LLM Fix</button>
+        <button class="toggle-btn active" id="togRestore"   onclick="toggle(this)">Restore Audio</button>
+        <button class="toggle-btn"        id="togNoEnhance" onclick="toggle(this)">Skip Enhance</button>
+      </div>
+    </div>
+  </div>
+
+  <button class="btn-start" id="btnStart" onclick="startJob()" disabled>
+    ▶ &nbsp; START PROCESSING
+  </button>
+
+  <div class="error-banner" id="errorBanner"></div>
+
+  <!-- Progress -->
+  <div class="progress-section" id="progressSection">
+    <p class="section-title">// Pipeline Progress</p>
+
+    <div class="steps" id="steps">
+      <div class="step" id="s1">Extract</div>
+      <div class="step" id="s2">Enhance</div>
+      <div class="step" id="s3">VAD</div>
+      <div class="step" id="s4">ASR</div>
+      <div class="step" id="s5">Postprocess</div>
+    </div>
+
+    <div class="progress-bar-wrap">
+      <div class="progress-bar indeterminate" id="progressBar"></div>
+    </div>
+    <div class="progress-status" id="progressStatus">Initializing...</div>
+
+    <div class="terminal" id="terminal"></div>
+  </div>
+
+  <!-- Transcript -->
+  <div class="transcript-box" id="transcriptBox">
+    <p class="section-title">// Transcript</p>
+    <div class="transcript-text" id="transcriptText"></div>
+  </div>
+
+  <!-- Downloads -->
+  <div class="downloads" id="downloads"></div>
+
+</div>
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
