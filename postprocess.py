@@ -782,8 +782,8 @@ def _resample(audio: "np.ndarray", from_sr: int, to_sr: int) -> "np.ndarray":
 
 def _prepare_tts_text(text: str) -> str:
     text = (text or "").replace(ASSUMPTION_TAG, "").replace(INAUDIBLE_TAG, "").strip()
-    text = re.sub(r'\[([^\[\]/]+)\]/\[[^\[\]]+\]', r' \1 ', text)
-    text = re.sub(r'\[([^/\]]+)/[^\]]+\]', r' \1 ', text)
+    text = re.sub(r'\[[^\[\]/]+\]/\[([^\[\]]+)\]', r' \1 ', text)
+    text = re.sub(r'\[[^/\]]+/([^\]]+)\]', r' \1 ', text)
     text = re.sub(r'\[([^\]]+)\?\]', r' \1 ', text)
     text = re.sub(r'[\[\]]', '', text)
     text = re.sub(r'(?<=\S)\s*/\s*(?=\S)', ' ', text)
